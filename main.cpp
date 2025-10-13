@@ -13,16 +13,17 @@
 #include <filesystem>
 #include <richedit.h> 
 #include "xxhash.h"   
+#include <chrono>
+#include <deque>
 
 // --- Link Libraries ---
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "Riched20.lib") 
 
 // =============================================================
-// FIX: STRUCT and ENUM Definitions MUST be declared before use!
+// Structures & Enums
 // =============================================================
 
-// --- Structures & Enum ---
 struct FileEntry {
     std::string path;
     std::string hash;
@@ -34,17 +35,51 @@ enum class HashType {
     XXH3
 };
 
-// --- Global UI Handles (unchanged) ---
+// --- Global UI Handles ---
 HWND g_hProgressGlobal, g_hProgressFile, g_hLabelFile, g_hLogBox;
 HWND g_hBtnStart, g_hBtnExit;
+HWND g_hLabelGlobalProgress, g_hLabelFileProgress;  // Nouveaux labels pour les pourcentages
 std::atomic<bool> g_IsRunning(false);
 
-// --- Global Counters (unchanged) ---
+// --- Global Counters ---
 std::atomic<int> g_CountOk(0);
 std::atomic<int> g_CountCorrupted(0);
 std::atomic<int> g_CountMissing(0);
 
-// --- Helpers (unchanged) ---
+// --- Speed calculation ---
+struct SpeedBuffer {
+    std::deque<std::pair<std::chrono::steady_clock::time_point, size_t>> samples;
+    const size_t maxSamples = 10;
+    
+    void AddSample(size_t bytes) {
+        auto now = std::chrono::steady_clock::now();
+        samples.push_back({now, bytes});
+        if (samples.size() > maxSamples) {
+            samples.pop_front();
+        }
+    }
+    
+    double GetSpeed() {
+        if (samples.size() < 2) return 0.0;
+        
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            samples.back().first - samples.front().first).count();
+        if (duration == 0) return 0.0;
+        
+        size_t totalBytes = 0;
+        for (size_t i = 1; i < samples.size(); i++) {
+            totalBytes += samples[i].second;
+        }
+        
+        return (totalBytes / 1024.0 / 1024.0) / (duration / 1000.0); // MB/s
+    }
+    
+    void Reset() {
+        samples.clear();
+    }
+};
+
+// --- Helpers ---
 std::string ToLower(const std::string &s) {
     std::string out = s;
     std::transform(out.begin(), out.end(), out.begin(), ::tolower);
@@ -59,36 +94,46 @@ std::string NormalizeHash(const std::string &h) {
     return s.empty() ? "0" : s;
 }
 
-// --- Append Log (Rich Edit Version with Color - UNCHANGED) ---
+std::string GetFileName(const std::string &path) {
+    size_t pos = path.find_last_of("\\/");
+    return (pos != std::string::npos) ? path.substr(pos + 1) : path;
+}
+
+std::string FormatFileSize(uint64_t bytes) {
+    const char* units[] = {"B", "KB", "MB", "GB"};
+    int i = 0;
+    double size = (double)bytes;
+    while (size >= 1024 && i < 3) {
+        size /= 1024;
+        i++;
+    }
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2) << size << " " << units[i];
+    return oss.str();
+}
+
+// --- Append Log (Rich Edit Version with Color) ---
 void AppendLog(const std::string &text, COLORREF color) {
-    // Conversion std::string -> std::wstring
     int size_needed = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), (int)text.length(), NULL, 0);
     std::wstring wtext(size_needed, 0);
     MultiByteToWideChar(CP_UTF8, 0, text.c_str(), (int)text.length(), &wtext[0], size_needed);
     
     std::wstring wline = wtext + L"\r\n";
     
-    // 1. Set the caret to the end of the text
     DWORD len = GetWindowTextLengthW(g_hLogBox);
     SendMessage(g_hLogBox, EM_SETSEL, (WPARAM)len, (LPARAM)len);
 
-    // 2. Define the character format (color)
     CHARFORMAT2W cf = {}; 
     cf.cbSize = sizeof(cf);
     cf.dwMask = CFM_COLOR;
     cf.crTextColor = color;
     
-    // 3. Apply the format (color)
     SendMessage(g_hLogBox, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
-
-    // 4. Insert the text
     SendMessageW(g_hLogBox, EM_REPLACESEL, FALSE, (LPARAM)wline.c_str());
-
-    // 5. Scroll to the bottom
     SendMessage(g_hLogBox, WM_VSCROLL, SB_BOTTOM, 0);
 }
 
-// --- CRC32 table (unchanged) ---
+// --- CRC32 table ---
 uint32_t crc32_table[256];
 void MakeCrcTable() {
     const uint32_t POLY = 0xEDB88320u;
@@ -100,9 +145,31 @@ void MakeCrcTable() {
     }
 }
 
-// --- Verify File (NOW COMPILES CORRECTLY) ---
+// --- Update File Progress Label ---
+void UpdateFileProgressLabel(const std::string &filename, int percentage, double speed = -1) {
+    std::ostringstream oss;
+    oss << "File: " << filename << " - " << percentage << "%";
+    if (speed >= 0) {
+        oss << " (" << std::fixed << std::setprecision(2) << speed << " MB/s)";
+    }
+    SetWindowTextA(g_hLabelFileProgress, oss.str().c_str());
+}
+
+// --- Update Global Progress Label ---
+void UpdateGlobalProgressLabel(int current, int total) {
+    int percentage = (total > 0) ? (current * 100 / total) : 0;
+    std::ostringstream oss;
+    oss << "Total Progress: " << current << "/" << total << " (" << percentage << "%)";
+    SetWindowTextA(g_hLabelGlobalProgress, oss.str().c_str());
+}
+
+// --- Verify File with Enhanced Progress ---
 std::string VerifyFile(const FileEntry &item, HashType hashType, std::atomic<int> &fileProgress, uint64_t &fileSize) {
     namespace fs = std::filesystem;
+    
+    std::string filename = GetFileName(item.path);
+    UpdateFileProgressLabel(filename, 0);
+    
     if (!fs::exists(item.path)) {
         g_CountMissing++;
         return "MISSING"; 
@@ -122,15 +189,15 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, std::atomic<int
         return "ERROR_OPEN"; 
     }
 
-    const size_t BUF = 64 * 1024;
+    // Augmenter la taille du buffer pour de meilleures performances
+    const size_t BUF = 256 * 1024;  // 256KB buffer
     std::vector<char> buffer(BUF);
     size_t readTotal = 0;
+    
+    SpeedBuffer speedBuffer;
+    auto lastUpdate = std::chrono::steady_clock::now();
 
-    int progressRange = (int)(fileSize / 1024);
-    if (progressRange == 0 && fileSize > 0) progressRange = 1; 
-    if (progressRange == 0) progressRange = 100;
-
-    SendMessage(g_hProgressFile, PBM_SETRANGE, 0, MAKELPARAM(0, progressRange));
+    SendMessage(g_hProgressFile, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
 
     std::string result = "ERROR_UNKNOWN";
 
@@ -140,11 +207,24 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, std::atomic<int
             f.read(buffer.data(), BUF);
             std::streamsize r = f.gcount();
             if (r == 0) break;
+            
             for (int i = 0; i < r; i++)
                 crc = (crc >> 8) ^ crc32_table[(crc ^ (uint8_t)buffer[i]) & 0xFF];
+            
             readTotal += r;
-            fileProgress = (int)(readTotal / 1024);
-            SendMessage(g_hProgressFile, PBM_SETPOS, fileProgress, 0);
+            speedBuffer.AddSample(r);
+            
+            // Update progress
+            int percentage = (fileSize > 0) ? (int)(readTotal * 100 / fileSize) : 0;
+            SendMessage(g_hProgressFile, PBM_SETPOS, percentage, 0);
+            
+            // Update label every 100ms
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastUpdate).count() >= 100) {
+                UpdateFileProgressLabel(filename, percentage, speedBuffer.GetSpeed());
+                lastUpdate = now;
+            }
+            
             if (!g_IsRunning) return "CANCELED";
         }
         crc ^= 0xFFFFFFFFu;
@@ -161,10 +241,23 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, std::atomic<int
             f.read(buffer.data(), BUF);
             std::streamsize r = f.gcount();
             if (r == 0) break;
+            
             XXH3_64bits_update(state, buffer.data(), r);
+            
             readTotal += r;
-            fileProgress = (int)(readTotal / 1024);
-            SendMessage(g_hProgressFile, PBM_SETPOS, fileProgress, 0);
+            speedBuffer.AddSample(r);
+            
+            // Update progress
+            int percentage = (fileSize > 0) ? (int)(readTotal * 100 / fileSize) : 0;
+            SendMessage(g_hProgressFile, PBM_SETPOS, percentage, 0);
+            
+            // Update label every 100ms
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastUpdate).count() >= 100) {
+                UpdateFileProgressLabel(filename, percentage, speedBuffer.GetSpeed());
+                lastUpdate = now;
+            }
+            
             if (!g_IsRunning) {
                 XXH3_freeState(state);
                 return "CANCELED";
@@ -178,6 +271,11 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, std::atomic<int
         result = NormalizeHash(oss.str()) == NormalizeHash(item.hash) ? "OK" : "CORRUPTED";
     }
     
+    // Final update to show 100%
+    if (result == "OK" || result == "CORRUPTED") {
+        UpdateFileProgressLabel(filename, 100, speedBuffer.GetSpeed());
+    }
+    
     if (result == "OK") {
         g_CountOk++;
     } else if (result == "CORRUPTED" || result.rfind("ERROR", 0) == 0) {
@@ -187,7 +285,7 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, std::atomic<int
     return result;
 }
 
-// --- Load CRC (NOW COMPILES CORRECTLY) ---
+// --- Load CRC ---
 bool LoadCRC(const std::string &filename, std::vector<FileEntry> &outFiles, HashType &outHashType) {
     std::ifstream f(filename);
     if (!f.is_open()) return false;
@@ -213,7 +311,7 @@ bool LoadCRC(const std::string &filename, std::vector<FileEntry> &outFiles, Hash
     return true;
 }
 
-// --- Report Generator (unchanged) ---
+// --- Report Generator ---
 void GenerateReport(int total) {
     if (total == 0) {
         AppendLog("\n--- FINAL REPORT (0 files) ---", RGB(0, 0, 0));
@@ -234,31 +332,27 @@ void GenerateReport(int total) {
     AppendLog("\n--- FINAL REPORT ---", RGB(0, 0, 0));
     AppendLog("Total Files: " + std::to_string(total), RGB(0, 0, 0));
 
-    // Green
     oss.str(""); oss.clear();
     oss << "OK (Green): " << ok << " files (" << p_ok << "%)";
     AppendLog(oss.str(), RGB(0, 150, 0)); 
 
-    // Red
     oss.str(""); oss.clear();
     oss << "CORRUPTED (Red): " << corrupted << " files (" << p_corrupted << "%)";
     AppendLog(oss.str(), RGB(200, 0, 0)); 
 
-    // Yellow
     oss.str(""); oss.clear();
     oss << "MISSING (Yellow): " << missing << " files (" << p_missing << "%)";
     AppendLog(oss.str(), RGB(255, 165, 0)); 
 }
 
-
-// --- Worker Thread (NOW COMPILES CORRECTLY) ---
+// --- Worker Thread ---
 void Worker() {
     g_CountOk = 0;
     g_CountCorrupted = 0;
     g_CountMissing = 0;
     
     MakeCrcTable();
-    std::vector<FileEntry> files; // FileEntry and HashType are now known
+    std::vector<FileEntry> files;
     HashType hashType = HashType::NONE;
 
     std::vector<std::string> candidates = {"CRC.xxhash3", "CRC.crc32"};
@@ -279,6 +373,8 @@ void Worker() {
         AppendLog("ERROR: No supported CRC file (XXH3 or CRC32) found!", RGB(200, 0, 0));
         g_IsRunning = false;
         SetWindowTextW(g_hBtnStart, TEXT("Start"));
+        UpdateFileProgressLabel("", 0);
+        UpdateGlobalProgressLabel(0, 0);
         return;
     }
     
@@ -289,34 +385,41 @@ void Worker() {
         AppendLog("The CRC file is empty!", RGB(200, 0, 0));
         g_IsRunning = false;
         SetWindowTextW(g_hBtnStart, TEXT("Start"));
+        UpdateFileProgressLabel("", 0);
+        UpdateGlobalProgressLabel(0, 0);
         return;
     }
 
+    // Configuration de la barre de progression globale
     SendMessage(g_hProgressGlobal, PBM_SETRANGE, 0, MAKELPARAM(0, total));
+    
+    auto startTime = std::chrono::steady_clock::now();
     int i = 0;
 
-    for (auto &f : files) { // 'files' is now recognized as std::vector<FileEntry>
+    for (auto &f : files) {
         if (!g_IsRunning) break;
 
         std::atomic<int> fileProgress(0);
         uint64_t fileSize = 0;
         
-        SetWindowTextA(g_hLabelFile, f.path.c_str());
-
+        // Update global progress
+        UpdateGlobalProgressLabel(i, total);
+        
         std::string status = VerifyFile(f, hashType, fileProgress, fileSize);
         
         COLORREF statusColor;
         std::string statusPrefix;
+        std::string sizeStr = FormatFileSize(fileSize);
 
         if (status == "OK") {
             statusPrefix = "[✓] ";
-            statusColor = RGB(0, 150, 0); // Green
+            statusColor = RGB(0, 150, 0);
         } else if (status == "CORRUPTED" || status.rfind("ERROR", 0) == 0) {
             statusPrefix = "[✗] ";
-            statusColor = RGB(200, 0, 0); // Red
+            statusColor = RGB(200, 0, 0);
         } else if (status == "MISSING") {
             statusPrefix = "[?] ";
-            statusColor = RGB(255, 165, 0); // Yellow/Orange
+            statusColor = RGB(255, 165, 0);
         } else if (status == "CANCELED") {
             break; 
         } else {
@@ -324,36 +427,42 @@ void Worker() {
             statusColor = RGB(200, 0, 0); 
         }
 
-        std::string logLine = statusPrefix + f.path + " - " + status;
+        std::string logLine = statusPrefix + f.path + " (" + sizeStr + ") - " + status;
         AppendLog(logLine, statusColor);
 
         SendMessage(g_hProgressGlobal, PBM_SETPOS, ++i, 0);
     }
     
+    // Calculate total time
+    auto endTime = std::chrono::steady_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime).count();
+    
+    // Reset file progress
+    SendMessage(g_hProgressFile, PBM_SETPOS, 0, 0);
+    UpdateFileProgressLabel("", 0);
+    
     // Finalization
     if (g_IsRunning) {
-        SetWindowTextW(g_hLabelFile, TEXT("FINISHED!"));
-        AppendLog("\n✓ Verification process finished!", RGB(0, 150, 0));
+        UpdateGlobalProgressLabel(total, total);
+        std::ostringstream oss;
+        oss << "✓ Verification process finished! (Time: " << duration << " seconds)";
+        AppendLog("\n" + oss.str(), RGB(0, 150, 0));
         GenerateReport(total);
     } else {
-        SetWindowTextW(g_hLabelFile, TEXT("CANCELED!"));
         AppendLog("\n! Process canceled!", RGB(200, 0, 0));
     }
-    
-    SendMessage(g_hProgressFile, PBM_SETPOS, 0, 0);
     
     g_IsRunning = false;
     SetWindowTextW(g_hBtnStart, TEXT("Start"));
 }
 
-// --- Window Procedure (unchanged) ---
+// --- Window Procedure ---
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case 1: // Start/Stop
             if (!g_IsRunning) {
-                // CLEAR LOG: Set selection to all (-1) and replace with empty string
                 SendMessage(g_hLogBox, EM_SETSEL, 0, -1); 
                 SendMessage(g_hLogBox, EM_REPLACESEL, 0, (LPARAM)L""); 
                 
@@ -381,9 +490,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return 0;
 }
 
-// --- WinMain (unchanged) ---
+// --- WinMain ---
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
-    // 1. Initialisation du Rich Edit (inchangée)
+    // 1. Initialisation du Rich Edit
     HMODULE hRichedit = LoadLibrary(TEXT("Msftedit.dll")); 
     if (!hRichedit) {
         hRichedit = LoadLibrary(TEXT("riched20.dll"));
@@ -398,21 +507,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
     LPWSTR *szArglist = CommandLineToArgvW(GetCommandLineW(), &nArgs);
 
     if (szArglist) {
-        // Commencer à 1 pour ignorer le nom de l'exécutable (szArglist[0])
         for (int i = 1; i < nArgs; i++) {
-            // Comparer l'argument avec "-v" ou "/v" (sans distinction de casse)
-            if ( (lstrcmpiW(szArglist[i], L"-v") == 0) || 
-                 (lstrcmpiW(szArglist[i], L"/v") == 0) ) 
-            {
+            if ((lstrcmpiW(szArglist[i], L"-v") == 0) || 
+                (lstrcmpiW(szArglist[i], L"/v") == 0)) {
                 startImmediately = true;
                 break;
             }
         }
-        // Libérer la mémoire allouée par CommandLineToArgvW
         LocalFree(szArglist);
     }
 
-    // 3. Initialisation de la fenêtre (inchangée)
+    // 3. Initialisation de la fenêtre
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS };
     InitCommonControlsEx(&icc);
 
@@ -426,32 +531,56 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
 
     if (!RegisterClassW(&wc)) return 0; 
 
-    HWND hwnd = CreateWindowExW(0, L"MainWin", L"NewCrc v0.1", WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 700, 500, nullptr, nullptr, hInst, nullptr);
+    HWND hwnd = CreateWindowExW(0, L"MainWin", L"NewCrc v0.2", 
+        WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX,
+        CW_USEDEFAULT, CW_USEDEFAULT, 700, 540, nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 0;
 
-    // Création des contrôles (inchangée)
-    // ... (omission des CreateWindowExW pour les boutons/progress bars pour la concision)
-    g_hLabelFile = CreateWindowExW(0, TEXT("STATIC"), TEXT("File..."), WS_CHILD | WS_VISIBLE, 10, 10, 660, 25, hwnd, nullptr, hInst, nullptr);
+    // Création des contrôles avec nouvelles positions
+    g_hLabelFile = CreateWindowExW(0, TEXT("STATIC"), TEXT("Ready..."), 
+        WS_CHILD | WS_VISIBLE, 10, 10, 660, 20, hwnd, nullptr, hInst, nullptr);
+    
+    // Log box
     LPCWSTR richEditClassName = hRichedit ? L"RICHEDIT50W" : L"EDIT"; 
-    g_hLogBox = CreateWindowExW(WS_EX_CLIENTEDGE, richEditClassName, L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY, 10, 40, 660, 320, hwnd, nullptr, hInst, nullptr);
+    g_hLogBox = CreateWindowExW(WS_EX_CLIENTEDGE, richEditClassName, L"", 
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY, 
+        10, 35, 660, 300, hwnd, nullptr, hInst, nullptr);
+    
     if (hRichedit && !g_hLogBox) {
         richEditClassName = L"RICHEDIT_CLASSW";
-        g_hLogBox = CreateWindowExW(WS_EX_CLIENTEDGE, richEditClassName, L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY, 10, 40, 660, 320, hwnd, nullptr, hInst, nullptr);
+        g_hLogBox = CreateWindowExW(WS_EX_CLIENTEDGE, richEditClassName, L"", 
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY, 
+            10, 35, 660, 300, hwnd, nullptr, hInst, nullptr);
     }
-    g_hProgressFile = CreateWindowExW(0, PROGRESS_CLASS, nullptr, WS_CHILD | WS_VISIBLE, 10, 370, 450, 20, hwnd, nullptr, hInst, nullptr);
-    g_hProgressGlobal = CreateWindowExW(0, PROGRESS_CLASS, nullptr, WS_CHILD | WS_VISIBLE, 10, 400, 660, 20, hwnd, nullptr, hInst, nullptr);
-    g_hBtnStart = CreateWindowExW(0, TEXT("BUTTON"), TEXT("Start"), WS_CHILD | WS_VISIBLE, 480, 370, 90, 25, hwnd, (HMENU)1, hInst, nullptr);
-    g_hBtnExit = CreateWindowExW(0, TEXT("BUTTON"), TEXT("Exit"), WS_CHILD | WS_VISIBLE, 580, 370, 90, 25, hwnd, (HMENU)2, hInst, nullptr);
-
+    
+    // Label pour la progression du fichier
+    g_hLabelFileProgress = CreateWindowExW(0, TEXT("STATIC"), TEXT("File: Ready"), 
+        WS_CHILD | WS_VISIBLE, 10, 345, 660, 20, hwnd, nullptr, hInst, nullptr);
+    
+    // Barre de progression du fichier
+    g_hProgressFile = CreateWindowExW(0, PROGRESS_CLASS, nullptr, 
+        WS_CHILD | WS_VISIBLE | PBS_SMOOTH, 10, 370, 450, 20, hwnd, nullptr, hInst, nullptr);
+    
+    // Label pour la progression globale
+    g_hLabelGlobalProgress = CreateWindowExW(0, TEXT("STATIC"), TEXT("Total Progress: 0/0 (0%)"), 
+        WS_CHILD | WS_VISIBLE, 10, 400, 660, 20, hwnd, nullptr, hInst, nullptr);
+    
+    // Barre de progression globale
+    g_hProgressGlobal = CreateWindowExW(0, PROGRESS_CLASS, nullptr, 
+        WS_CHILD | WS_VISIBLE | PBS_SMOOTH, 10, 425, 660, 20, hwnd, nullptr, hInst, nullptr);
+    
+    // Boutons
+    g_hBtnStart = CreateWindowExW(0, TEXT("BUTTON"), TEXT("Start"), 
+        WS_CHILD | WS_VISIBLE, 480, 370, 90, 25, hwnd, (HMENU)1, hInst, nullptr);
+    
+    g_hBtnExit = CreateWindowExW(0, TEXT("BUTTON"), TEXT("Exit"), 
+        WS_CHILD | WS_VISIBLE, 580, 370, 90, 25, hwnd, (HMENU)2, hInst, nullptr);
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
     
     // 4. Démarrage automatique si l'argument est trouvé
     if (startImmediately) {
-        // Le code de démarrage est le même que le bouton "Start"
-        // Nous effaçons le log, démarrons le thread Worker et changeons le texte du bouton.
         SendMessage(g_hLogBox, EM_SETSEL, 0, -1); 
         SendMessage(g_hLogBox, EM_REPLACESEL, 0, (LPARAM)L""); 
         
@@ -460,7 +589,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
         SetWindowTextW(g_hBtnStart, TEXT("Stop"));
     }
 
-    // 5. Boucle de messages (inchangée)
+    // 5. Boucle de messages
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
