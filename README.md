@@ -1,5 +1,7 @@
 # NewCrc
 
+Ia use in code cause C++ pain 
+
 This is a Win32 GUI application for verifying file integrity using CRC32 or XXH3 hashes.
 
 ### Usage
