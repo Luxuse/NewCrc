@@ -383,16 +383,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 // --- WinMain (unchanged) ---
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
-    // Load MSFTEDIT.DLL for Rich Edit 5.0 (RICHEDIT50W)
+    // 1. Initialisation du Rich Edit (inchangée)
     HMODULE hRichedit = LoadLibrary(TEXT("Msftedit.dll")); 
     if (!hRichedit) {
-        // Fallback to older Riched20.dll if Msftedit.dll is missing
         hRichedit = LoadLibrary(TEXT("riched20.dll"));
         if (!hRichedit) {
-            MessageBoxW(NULL, L"Failed to load RichEdit library (Msftedit.dll or riched20.dll)! Log coloring will not work.", L"Error", MB_ICONERROR);
+            MessageBoxW(NULL, L"Failed to load RichEdit library! Log coloring might fail.", L"Error", MB_ICONERROR);
         }
     }
 
+    // 2. Traitement des arguments de ligne de commande
+    bool startImmediately = false;
+    int nArgs;
+    LPWSTR *szArglist = CommandLineToArgvW(GetCommandLineW(), &nArgs);
+
+    if (szArglist) {
+        // Commencer à 1 pour ignorer le nom de l'exécutable (szArglist[0])
+        for (int i = 1; i < nArgs; i++) {
+            // Comparer l'argument avec "-v" ou "/v" (sans distinction de casse)
+            if ( (lstrcmpiW(szArglist[i], L"-v") == 0) || 
+                 (lstrcmpiW(szArglist[i], L"/v") == 0) ) 
+            {
+                startImmediately = true;
+                break;
+            }
+        }
+        // Libérer la mémoire allouée par CommandLineToArgvW
+        LocalFree(szArglist);
+    }
+
+    // 3. Initialisation de la fenêtre (inchangée)
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS };
     InitCommonControlsEx(&icc);
 
@@ -406,47 +426,47 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
 
     if (!RegisterClassW(&wc)) return 0; 
 
-    HWND hwnd = CreateWindowExW(0, L"MainWin", L"NewCrc C++ Win32", WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+    HWND hwnd = CreateWindowExW(0, L"MainWin", L"NewCrc v0.1", WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 700, 500, nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 0;
 
-    // Controls (using W version)
-    g_hLabelFile = CreateWindowExW(0, TEXT("STATIC"), TEXT("File..."), WS_CHILD | WS_VISIBLE,
-        10, 10, 660, 25, hwnd, nullptr, hInst, nullptr);
-        
-    // Use the appropriate RichEdit class name based on loaded DLL
-    LPCWSTR richEditClassName = hRichedit ? L"RICHEDIT50W" : L"EDIT"; // Use EDIT as a final fallback
-
-    g_hLogBox = CreateWindowExW(WS_EX_CLIENTEDGE, richEditClassName, L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY,
-        10, 40, 660, 320, hwnd, nullptr, hInst, nullptr);
-    
-    // Fallback if RICHEDIT50W creation failed, try RICHEDIT_CLASSW
+    // Création des contrôles (inchangée)
+    // ... (omission des CreateWindowExW pour les boutons/progress bars pour la concision)
+    g_hLabelFile = CreateWindowExW(0, TEXT("STATIC"), TEXT("File..."), WS_CHILD | WS_VISIBLE, 10, 10, 660, 25, hwnd, nullptr, hInst, nullptr);
+    LPCWSTR richEditClassName = hRichedit ? L"RICHEDIT50W" : L"EDIT"; 
+    g_hLogBox = CreateWindowExW(WS_EX_CLIENTEDGE, richEditClassName, L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY, 10, 40, 660, 320, hwnd, nullptr, hInst, nullptr);
     if (hRichedit && !g_hLogBox) {
         richEditClassName = L"RICHEDIT_CLASSW";
-        g_hLogBox = CreateWindowExW(WS_EX_CLIENTEDGE, richEditClassName, L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY,
-        10, 40, 660, 320, hwnd, nullptr, hInst, nullptr);
+        g_hLogBox = CreateWindowExW(WS_EX_CLIENTEDGE, richEditClassName, L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY, 10, 40, 660, 320, hwnd, nullptr, hInst, nullptr);
     }
-    // If the log box is STILL NULL, we have a serious issue, but we proceed.
+    g_hProgressFile = CreateWindowExW(0, PROGRESS_CLASS, nullptr, WS_CHILD | WS_VISIBLE, 10, 370, 450, 20, hwnd, nullptr, hInst, nullptr);
+    g_hProgressGlobal = CreateWindowExW(0, PROGRESS_CLASS, nullptr, WS_CHILD | WS_VISIBLE, 10, 400, 660, 20, hwnd, nullptr, hInst, nullptr);
+    g_hBtnStart = CreateWindowExW(0, TEXT("BUTTON"), TEXT("Start"), WS_CHILD | WS_VISIBLE, 480, 370, 90, 25, hwnd, (HMENU)1, hInst, nullptr);
+    g_hBtnExit = CreateWindowExW(0, TEXT("BUTTON"), TEXT("Exit"), WS_CHILD | WS_VISIBLE, 580, 370, 90, 25, hwnd, (HMENU)2, hInst, nullptr);
 
-    g_hProgressFile = CreateWindowExW(0, PROGRESS_CLASS, nullptr, WS_CHILD | WS_VISIBLE,
-        10, 370, 450, 20, hwnd, nullptr, hInst, nullptr);
-    g_hProgressGlobal = CreateWindowExW(0, PROGRESS_CLASS, nullptr, WS_CHILD | WS_VISIBLE,
-        10, 400, 660, 20, hwnd, nullptr, hInst, nullptr);
-    g_hBtnStart = CreateWindowExW(0, TEXT("BUTTON"), TEXT("Start"), WS_CHILD | WS_VISIBLE,
-        480, 370, 90, 25, hwnd, (HMENU)1, hInst, nullptr);
-    g_hBtnExit = CreateWindowExW(0, TEXT("BUTTON"), TEXT("Exit"), WS_CHILD | WS_VISIBLE,
-        580, 370, 90, 25, hwnd, (HMENU)2, hInst, nullptr);
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
+    
+    // 4. Démarrage automatique si l'argument est trouvé
+    if (startImmediately) {
+        // Le code de démarrage est le même que le bouton "Start"
+        // Nous effaçons le log, démarrons le thread Worker et changeons le texte du bouton.
+        SendMessage(g_hLogBox, EM_SETSEL, 0, -1); 
+        SendMessage(g_hLogBox, EM_REPLACESEL, 0, (LPARAM)L""); 
+        
+        g_IsRunning = true;
+        std::thread(Worker).detach();
+        SetWindowTextW(g_hBtnStart, TEXT("Stop"));
+    }
 
+    // 5. Boucle de messages (inchangée)
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
 
-    // Clean up RichEdit DLL
     if (hRichedit) FreeLibrary(hRichedit);
     
     return (int)msg.wParam;
