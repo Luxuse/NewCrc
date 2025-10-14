@@ -192,7 +192,7 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, std::atomic<int
     }
 
     // Augmenter la taille du buffer pour de meilleures performances
-    const size_t BUF = 256 * 1024;  // 256KB buffer
+    const size_t BUF = (512) * 1024;  // 512 buffer
     std::vector<char> buffer(BUF);
     size_t readTotal = 0;
     
@@ -576,7 +576,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
 
     if (!RegisterClassW(&wc)) return 0; 
 
-    HWND hwnd = CreateWindowExW(0, L"MainWin", L"NewCrc v0.2", 
+    HWND hwnd = CreateWindowExW(0, L"MainWin", L"NewCrc v0.3", 
         WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 700, 540, nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 0;
