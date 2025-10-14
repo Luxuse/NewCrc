@@ -192,7 +192,8 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, std::atomic<int
     }
 
     // Augmenter la taille du buffer pour de meilleures performances
-    const size_t BUF = (512) * 1024;  // 512 buffer
+    const size_t BUF = 3 * 1024 * 1024; // 3 Mo buffer
+
     std::vector<char> buffer(BUF);
     size_t readTotal = 0;
     
