@@ -9,6 +9,6 @@ walkdir = "2"
 rayon = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crc32fast = "1"
-cityhash = "0.2"
+cityhash = "0.1.1"
 indicatif = "0.17"
 num_cpus = "1.16"

@@ -8,9 +8,9 @@ use std::{
 };
 use walkdir::WalkDir;
 use indicatif::{ProgressBar, ProgressStyle};
-
-// Ajoute cityhash crate dans Cargo.toml
-// 
+use crc32fast::Hasher as Crc32Hasher;
+use xxhash_rust::xxh3::Xxh3;
+use cityhash::city_hash_128;
 
 const DEFAULT_FULL_LOAD_LIMIT: u64 = 200 * 1024 * 1024;
 
@@ -144,32 +144,37 @@ fn hash_file(path: &Path, full_load_limit: u64, algo: HashAlgo) -> io::Result<(S
         file.read_to_end(&mut buf)?;
         let digest = match algo {
             HashAlgo::Crc32 => format!("{:08x}", crc32fast::hash(&buf)),
-            HashAlgo::City128 => format!("{:032x}", cityhash::city128(&buf)),
+            HashAlgo::City128 => format!("{:032x}", city_hash_128(&buf)),
             HashAlgo::Xxh3 => format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&buf)),
         };
         Ok((digest, size))
     } else {
-        let mut hasher_crc32 = crc32fast::Hasher::new();
+        let mut hasher_crc32 = Crc32Hasher::new();
         let mut buf = [0u8; 1024 * 1024];
-        let mut city_hash_val = cityhash::CityHasher128::new();
-        let mut hasher_xxh3 = xxhash_rust::xxh3::Xxh3::new();
+        let mut xxh3_hasher = Xxh3::new();
+        let mut city_digest = 0u128;
 
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            match algo {
-                HashAlgo::Crc32 => hasher_crc32.update(&buf[..n]),
-                HashAlgo::City128 => city_hash_val.update(&buf[..n]),
-                HashAlgo::Xxh3 => hasher_xxh3.update(&buf[..n]),
+        if let HashAlgo::City128 = algo {
+            // City128 nécessite de lire tout le fichier
+            let mut full_buf = Vec::with_capacity(size as usize);
+            file.read_to_end(&mut full_buf)?;
+            city_digest = city_hash_128(&full_buf);
+        } else {
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 { break; }
+                match algo {
+                    HashAlgo::Crc32 => hasher_crc32.update(&buf[..n]),
+                    HashAlgo::Xxh3 => xxh3_hasher.update(&buf[..n]),
+                    _ => {}
+                }
             }
         }
 
         let digest = match algo {
             HashAlgo::Crc32 => format!("{:08x}", hasher_crc32.finalize()),
-            HashAlgo::City128 => format!("{:032x}", city_hash_val.digest()),
-            HashAlgo::Xxh3 => format!("{:016x}", hasher_xxh3.digest()),
+            HashAlgo::City128 => format!("{:032x}", city_digest),
+            HashAlgo::Xxh3 => format!("{:016x}", xxh3_hasher.digest()),
         };
         Ok((digest, size))
     }
