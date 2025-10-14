@@ -11,8 +11,9 @@
 #include <algorithm>
 #include <iostream>
 #include <filesystem>
-#include <richedit.h> 
-#include "xxhash.h"   
+#include <richedit.h>
+#include "xxhash.h"
+#include "city.h"    // <-- CityHash (CityHash128)
 #include <chrono>
 #include <deque>
 
@@ -32,7 +33,8 @@ struct FileEntry {
 enum class HashType {
     NONE,
     CRC32,
-    XXH3
+    XXH3,
+    CITY128   // ajouté
 };
 
 // --- Global UI Handles ---
@@ -190,7 +192,7 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, std::atomic<int
     }
 
     // Augmenter la taille du buffer pour de meilleures performances
-    const size_t BUF = 256 * 1024;  // 256KB buffer
+    const size_t BUF = (512) * 1024;  // 512 buffer
     std::vector<char> buffer(BUF);
     size_t readTotal = 0;
     
@@ -270,6 +272,47 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, std::atomic<int
         oss << std::hex << std::setw(16) << std::setfill('0') << h;
         result = NormalizeHash(oss.str()) == NormalizeHash(item.hash) ? "OK" : "CORRUPTED";
     }
+    else if (hashType == HashType::CITY128) {
+        // For CityHash128 we read the entire file into memory (CityHash128 doesn't provide streaming API)
+        // If files are huge this may use a lot of RAM. Adjust strategy if needed.
+        try {
+            std::vector<char> all;
+            all.reserve((size_t)std::min<uint64_t>(fileSize, (uint64_t)SIZE_MAX));
+            while (f) {
+                f.read(buffer.data(), BUF);
+                std::streamsize r = f.gcount();
+                if (r == 0) break;
+                all.insert(all.end(), buffer.data(), buffer.data() + r);
+                
+                readTotal += r;
+                speedBuffer.AddSample(r);
+                
+                int percentage = (fileSize > 0) ? (int)(readTotal * 100 / fileSize) : 0;
+                SendMessage(g_hProgressFile, PBM_SETPOS, percentage, 0);
+                
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastUpdate).count() >= 100) {
+                    UpdateFileProgressLabel(filename, percentage, speedBuffer.GetSpeed());
+                    lastUpdate = now;
+                }
+                
+                if (!g_IsRunning) return "CANCELED";
+            }
+
+            // Compute CityHash128
+            uint128 hash128 = CityHash128(all.data(), all.size());
+            uint64_t low = Uint128Low64(hash128);
+            uint64_t high = Uint128High64(hash128);
+
+            std::ostringstream oss;
+            oss << std::hex << std::setw(16) << std::setfill('0') << high
+                << std::hex << std::setw(16) << std::setfill('0') << low;
+            result = NormalizeHash(oss.str()) == NormalizeHash(item.hash) ? "OK" : "CORRUPTED";
+        } catch (...) {
+            g_CountCorrupted++;
+            return "ERROR_CITY";
+        }
+    }
     
     // Final update to show 100%
     if (result == "OK" || result == "CORRUPTED") {
@@ -294,6 +337,8 @@ bool LoadCRC(const std::string &filename, std::vector<FileEntry> &outFiles, Hash
         outHashType = HashType::XXH3;
     else if (filename.find(".crc32") != std::string::npos)
         outHashType = HashType::CRC32;
+    else if (filename.find(".city128") != std::string::npos)  // support city128
+        outHashType = HashType::CITY128;
     else
         return false; 
 
@@ -355,7 +400,7 @@ void Worker() {
     std::vector<FileEntry> files;
     HashType hashType = HashType::NONE;
 
-    std::vector<std::string> candidates = {"CRC.xxhash3", "CRC.crc32"};
+    std::vector<std::string> candidates = {"CRC.xxhash3", "CRC.crc32", "CRC.city128"}; // ajouté city128
     bool fileFound = false;
     std::string loadedFile = "";
 
@@ -370,7 +415,7 @@ void Worker() {
     }
 
     if (!fileFound) {
-        AppendLog("ERROR: No supported CRC file (XXH3 or CRC32) found!", RGB(200, 0, 0));
+        AppendLog("ERROR: No supported CRC file (XXH3, CRC32 or CITY128) found!", RGB(200, 0, 0));
         g_IsRunning = false;
         SetWindowTextW(g_hBtnStart, TEXT("Start"));
         UpdateFileProgressLabel("", 0);
@@ -531,7 +576,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
 
     if (!RegisterClassW(&wc)) return 0; 
 
-    HWND hwnd = CreateWindowExW(0, L"MainWin", L"NewCrc v0.2", 
+    HWND hwnd = CreateWindowExW(0, L"MainWin", L"NewCrc v0.3", 
         WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 700, 540, nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 0;
