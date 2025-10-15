@@ -23,4 +23,7 @@ NewCrc.exe -v
 
 ```compile
  g++ -std=c++17 -O3 -static main.cpp xxhash.c city.cc -lole32 -lcomctl32 -lriched20 -municode -Wl,--subsystem,windows -o NewCrc.exe
+ or
+g++ -std=c++17 -Oz -static main.cpp xxhash.c city.cc -lole32 -lcomctl32 -lriched20 -municode -Wl,--subsystem,windows -o NewCrc.exe
 
+if you want tiny size
