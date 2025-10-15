@@ -17,7 +17,6 @@
 #include <chrono>
 #include <deque>
 #include <mutex>
-#include <queue>
 #include <condition_variable>
 
 // --- Link Libraries ---
@@ -31,6 +30,7 @@
 struct FileEntry {
     std::string path;
     std::string hash;
+    int index;
 };
 
 enum class HashType {
@@ -56,10 +56,11 @@ std::atomic<int> g_CountOk(0);
 std::atomic<int> g_CountCorrupted(0);
 std::atomic<int> g_CountMissing(0);
 std::atomic<int> g_FilesProcessed(0);
+std::atomic<int> g_NextFileIndex(0);
 
 // --- Thread synchronization ---
 std::mutex g_LogMutex;
-std::queue<LogEntry> g_LogQueue;
+std::vector<LogEntry> g_LogQueue;
 std::mutex g_ProgressMutex;
 std::string g_CurrentFileDisplay;
 std::atomic<int> g_CurrentFileProgress(0);
@@ -140,7 +141,7 @@ std::string FormatFileSize(uint64_t bytes) {
 // --- Queue Log (thread-safe) ---
 void QueueLog(const std::string &text, COLORREF color) {
     std::lock_guard<std::mutex> lock(g_LogMutex);
-    g_LogQueue.push({text, color});
+    g_LogQueue.push_back({text, color});
 }
 
 // --- Append Log (Rich Edit Version with Color) ---
@@ -166,10 +167,15 @@ void AppendLog(const std::string &text, COLORREF color) {
 
 // --- Process Log Queue (called from main thread) ---
 void ProcessLogQueue() {
-    std::lock_guard<std::mutex> lock(g_LogMutex);
-    while (!g_LogQueue.empty()) {
-        auto entry = g_LogQueue.front();
-        g_LogQueue.pop();
+    std::vector<LogEntry> tempQueue;
+    {
+        std::lock_guard<std::mutex> lock(g_LogMutex);
+        if (g_LogQueue.empty()) return;
+        tempQueue = std::move(g_LogQueue);
+        g_LogQueue.clear();
+    }
+    
+    for (const auto& entry : tempQueue) {
         AppendLog(entry.text, entry.color);
     }
 }
@@ -240,7 +246,7 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, uint64_t &fileS
 
     if (hashType == HashType::CRC32) {
         uint32_t crc = 0xFFFFFFFFu;
-        while (f) {
+        while (f && g_IsRunning) {
             f.read(buffer.data(), BUF);
             std::streamsize r = f.gcount();
             if (r == 0) break;
@@ -252,15 +258,18 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, uint64_t &fileS
             speedBuffer.AddSample(r);
             g_GlobalSpeedBuffer.AddSample(r);
             
-            {
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastUpdate).count() >= 200) {
                 std::lock_guard<std::mutex> lock(g_ProgressMutex);
                 g_CurrentFileDisplay = filename;
                 g_CurrentFileProgress = (fileSize > 0) ? (int)(readTotal * 100 / fileSize) : 0;
                 g_CurrentSpeed = speedBuffer.GetSpeed();
+                lastUpdate = now;
             }
-            
-            if (!g_IsRunning) return "CANCELED";
         }
+        
+        if (!g_IsRunning) return "CANCELED";
+        
         crc ^= 0xFFFFFFFFu;
         std::ostringstream oss;
         oss << std::hex << std::setw(8) << std::setfill('0') << crc;
@@ -271,7 +280,7 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, uint64_t &fileS
         if (!state) return "ERROR_XXH_INIT";
         
         XXH3_64bits_reset(state);
-        while (f) {
+        while (f && g_IsRunning) {
             f.read(buffer.data(), BUF);
             std::streamsize r = f.gcount();
             if (r == 0) break;
@@ -282,17 +291,19 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, uint64_t &fileS
             speedBuffer.AddSample(r);
             g_GlobalSpeedBuffer.AddSample(r);
             
-            {
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastUpdate).count() >= 200) {
                 std::lock_guard<std::mutex> lock(g_ProgressMutex);
                 g_CurrentFileDisplay = filename;
                 g_CurrentFileProgress = (fileSize > 0) ? (int)(readTotal * 100 / fileSize) : 0;
                 g_CurrentSpeed = speedBuffer.GetSpeed();
+                lastUpdate = now;
             }
-            
-            if (!g_IsRunning) {
-                XXH3_freeState(state);
-                return "CANCELED";
-            }
+        }
+        
+        if (!g_IsRunning) {
+            XXH3_freeState(state);
+            return "CANCELED";
         }
         
         uint64_t h = XXH3_64bits_digest(state);
@@ -305,7 +316,7 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, uint64_t &fileS
         try {
             std::vector<char> all;
             all.reserve((size_t)std::min<uint64_t>(fileSize, (uint64_t)SIZE_MAX));
-            while (f) {
+            while (f && g_IsRunning) {
                 f.read(buffer.data(), BUF);
                 std::streamsize r = f.gcount();
                 if (r == 0) break;
@@ -315,15 +326,17 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, uint64_t &fileS
                 speedBuffer.AddSample(r);
                 g_GlobalSpeedBuffer.AddSample(r);
                 
-                {
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastUpdate).count() >= 200) {
                     std::lock_guard<std::mutex> lock(g_ProgressMutex);
                     g_CurrentFileDisplay = filename;
                     g_CurrentFileProgress = (fileSize > 0) ? (int)(readTotal * 100 / fileSize) : 0;
                     g_CurrentSpeed = speedBuffer.GetSpeed();
+                    lastUpdate = now;
                 }
-                
-                if (!g_IsRunning) return "CANCELED";
             }
+
+            if (!g_IsRunning) return "CANCELED";
 
             uint128 hash128 = CityHash128(all.data(), all.size());
             uint64_t low = Uint128Low64(hash128);
@@ -363,6 +376,7 @@ bool LoadCRC(const std::string &filename, std::vector<FileEntry> &outFiles, Hash
         return false; 
 
     std::string line;
+    int idx = 0;
     while (std::getline(f, line)) {
         if (line.empty()) continue;
         std::istringstream iss(line);
@@ -371,7 +385,7 @@ bool LoadCRC(const std::string &filename, std::vector<FileEntry> &outFiles, Hash
         std::getline(iss, p);
         p.erase(std::remove(p.begin(), p.end(), '*'), p.end());
         p.erase(0, p.find_first_not_of(" \t"));
-        outFiles.push_back({p, h});
+        outFiles.push_back({p, h, idx++});
     }
     return true;
 }
@@ -410,31 +424,25 @@ void GenerateReport(int total) {
     QueueLog(oss.str(), RGB(255, 165, 0)); 
 }
 
-// --- Worker Thread Pool ---
-void WorkerThread(std::queue<FileEntry>* workQueue, std::mutex* queueMutex, 
-                  HashType hashType, int* total) {
+// --- Worker Thread ---
+void WorkerThread(std::vector<FileEntry>* files, HashType hashType) {
     MakeCrcTable();
     
     while (g_IsRunning) {
-        FileEntry item;
-        bool hasWork = false;
+        int idx = g_NextFileIndex++;
         
-        {
-            std::lock_guard<std::mutex> lock(*queueMutex);
-            if (!workQueue->empty()) {
-                item = workQueue->front();
-                workQueue->pop();
-                hasWork = true;
-            }
+        if (idx >= (int)files->size()) {
+            break;
         }
         
-        if (!hasWork) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
-        }
+        const FileEntry& item = (*files)[idx];
         
         uint64_t fileSize = 0;
         std::string status = VerifyFile(item, hashType, fileSize);
+        
+        if (status == "CANCELED") {
+            break;
+        }
         
         COLORREF statusColor;
         std::string statusPrefix;
@@ -449,8 +457,6 @@ void WorkerThread(std::queue<FileEntry>* workQueue, std::mutex* queueMutex,
         } else if (status == "MISSING") {
             statusPrefix = "[?] ";
             statusColor = RGB(255, 165, 0);
-        } else if (status == "CANCELED") {
-            break; 
         } else {
             statusPrefix = "[!] ";
             statusColor = RGB(200, 0, 0); 
@@ -469,6 +475,7 @@ void Worker() {
     g_CountCorrupted = 0;
     g_CountMissing = 0;
     g_FilesProcessed = 0;
+    g_NextFileIndex = 0;
     
     std::vector<FileEntry> files;
     HashType hashType = HashType::NONE;
@@ -508,26 +515,18 @@ void Worker() {
         return;
     }
 
-    // Determine thread count (use CPU cores, max 8 threads)
+    // Determine thread count
     unsigned int threadCount = std::min(std::thread::hardware_concurrency(), 8u);
     if (threadCount == 0) threadCount = 4;
     
     std::ostringstream oss;
     oss << "Starting verification with " << threadCount << " threads...";
     QueueLog(oss.str(), RGB(0, 0, 255));
-
-    // Create work queue
-    std::queue<FileEntry> workQueue;
-    for (auto &f : files) {
-        workQueue.push(f);
-    }
-    
-    std::mutex queueMutex;
     
     // Start worker threads
     std::vector<std::thread> workers;
     for (unsigned int i = 0; i < threadCount; i++) {
-        workers.emplace_back(WorkerThread, &workQueue, &queueMutex, hashType, &total);
+        workers.emplace_back(WorkerThread, &files, hashType);
     }
     
     SendMessage(g_hProgressGlobal, PBM_SETRANGE, 0, MAKELPARAM(0, total));
@@ -549,12 +548,15 @@ void Worker() {
             }
         }
         
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     
-    // Wait for all threads to finish
+    // Signal stop and wait for all threads
+    g_IsRunning = false;
     for (auto &t : workers) {
-        if (t.joinable()) t.join();
+        if (t.joinable()) {
+            t.join();
+        }
     }
     
     auto endTime = std::chrono::steady_clock::now();
@@ -563,19 +565,16 @@ void Worker() {
     SendMessage(g_hProgressFile, PBM_SETPOS, 0, 0);
     UpdateFileProgressLabel("", 0);
     
-    if (g_IsRunning) {
-        UpdateGlobalProgressLabel(total, total);
-        SendMessage(g_hProgressGlobal, PBM_SETPOS, total, 0);
-        
-        oss.str(""); oss.clear();
-        oss << "✓ Verification process finished! (Time: " << duration << " seconds)";
-        QueueLog("\n" + oss.str(), RGB(0, 150, 0));
-        GenerateReport(total);
-    } else {
-        QueueLog("\n! Process canceled!", RGB(200, 0, 0));
-    }
+    int finalProcessed = g_FilesProcessed;
+    UpdateGlobalProgressLabel(finalProcessed, total);
+    SendMessage(g_hProgressGlobal, PBM_SETPOS, finalProcessed, 0);
     
-    g_IsRunning = false;
+    oss.str(""); oss.clear();
+    oss << "\n✓ Verification finished! Processed: " << finalProcessed << "/" << total 
+        << " files (Time: " << duration << " seconds)";
+    QueueLog(oss.str(), RGB(0, 150, 0));
+    GenerateReport(total);
+    
     SetWindowTextW(g_hBtnStart, TEXT("Start"));
 }
 
@@ -594,7 +593,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 std::thread(Worker).detach();
                 SetWindowTextW(g_hBtnStart, TEXT("Stop"));
             } else {
-                g_IsRunning = false; 
+                g_IsRunning = false;
+                QueueLog("! Stopping verification...", RGB(255, 165, 0));
             }
             break;
         case 2: // Exit
@@ -658,7 +658,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
 
     if (!RegisterClassW(&wc)) return 0; 
 
-    HWND hwnd = CreateWindowExW(0, L"MainWin", L"NewCrc v0.4", 
+    HWND hwnd = CreateWindowExW(0, L"MainWin", L"NewCrc v0.4 - Multithreaded", 
         WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 700, 540, nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 0;
