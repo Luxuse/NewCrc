@@ -6,8 +6,7 @@ NewCrc is a Win32 GUI application for verifying file integrity using **CRC32**, 
 
 note ia use in code 
 ## Roadmap
-c++20 or 23 update 
-seperate main file 
+c++20 update
 
 ## Usage
 
