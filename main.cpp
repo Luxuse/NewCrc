@@ -1,14 +1,15 @@
 /**
  * @file main.cpp
  * @brief Application Win32 multithread pour la vérification de l'intégrité de fichiers par hachage.
- * @version 0.5 (Professional Multithreaded)
+ * @version 0.6 (Modern C++20/23)
  *
  * @details
  * Ce programme vérifie une liste de fichiers par rapport à leurs sommes de contrôle
  * (CRC32, XXH3, CityHash128) spécifiées dans un fichier manifeste.
- * L'architecture utilise un pool de threads pour paralléliser les calculs de hachage
- * et une communication asynchrone par messages Windows (PostMessage) pour mettre à jour
- * l'interface utilisateur sans la bloquer, garantissant une expérience fluide et réactive.
+ * L'architecture utilise un pool de std::jthread (C++20) pour paralléliser les calculs
+ * de hachage, un std::stop_token pour une annulation propre, et une communication
+ * asynchrone par PostMessage (avec std::unique_ptr pour la sécurité de la mémoire)
+ * pour mettre à jour l'interface utilisateur sans la bloquer.
  */
 
 // --- Inclusions Standards et Externes ---
@@ -18,14 +19,18 @@
 #include <string>
 #include <vector>
 #include <fstream>
-#include <sstream>
-#include <thread>
+#include <sstream>      // Gardé pour l'analyse de ligne (iss)
+#include <thread>       // Pour std::jthread
 #include <atomic>
 #include <iomanip>
 #include <algorithm>
 #include <filesystem>
 #include <chrono>
 #include <deque>
+#include <memory>       // Pour std::unique_ptr
+#include <format>       // Pour std::format (C++20)
+#include <string_view>  // Pour std::string_view (C++17)
+#include <mutex>        // Pour std::call_once
 
 // --- Inclusions des bibliothèques de hachage ---
 #include "xxhash.h"
@@ -40,17 +45,15 @@
 // =================================================================================
 
 // --- Messages personnalisés pour la communication inter-thread ---
-// Utilisés pour découpler le thread de travail du thread UI.
-#define WM_APP_UPDATE_FILE_PROGRESS   (WM_APP + 1) // Met à jour la progression d'un fichier unique
-#define WM_APP_UPDATE_GLOBAL_PROGRESS (WM_APP + 2) // Met à jour la progression globale
-#define WM_APP_APPEND_LOG             (WM_APP + 3) // Ajoute une ligne au log
-#define WM_APP_TASK_COMPLETE          (WM_APP + 4) // Signale la fin de toutes les opérations
-#define WM_APP_TASK_ERROR             (WM_APP + 5) // Signale une erreur critique de démarrage
+#define WM_APP_UPDATE_FILE_PROGRESS   (WM_APP + 1)
+#define WM_APP_UPDATE_GLOBAL_PROGRESS (WM_APP + 2)
+#define WM_APP_APPEND_LOG             (WM_APP + 3)
+#define WM_APP_TASK_COMPLETE          (WM_APP + 4)
+#define WM_APP_TASK_ERROR             (WM_APP + 5)
 
 /**
  * @struct FileProgressData
- * @brief Transporte les données de progression d'un fichier pour l'UI.
- * Alloué dans le thread worker, libéré dans le thread UI.
+ * @brief Transporte les données de progression. Géré par std::unique_ptr.
  */
 struct FileProgressData {
     std::wstring filename;
@@ -60,7 +63,7 @@ struct FileProgressData {
 
 /**
  * @struct LogData
- * @brief Transporte le texte et la couleur pour un message de log.
+ * @brief Transporte les données de log. Géré par std::unique_ptr.
  */
 struct LogData {
     std::wstring text;
@@ -69,7 +72,7 @@ struct LogData {
 
 /**
  * @struct TaskCompleteData
- * @brief Transporte les statistiques finales à la fin du processus.
+ * @brief Transporte les statistiques finales. Géré par std::unique_ptr.
  */
 struct TaskCompleteData {
     int totalFiles;
@@ -92,14 +95,31 @@ struct FileEntry {
  */
 enum class HashType { NONE, CRC32, XXH3, CITY128 };
 
+/**
+ * @enum VerifyStatus
+ * @brief Statut de retour typé pour la vérification de fichier.
+ */
+enum class VerifyStatus {
+    OK,
+    CORRUPTED,
+    MISSING,
+    ERROR_SIZE,
+    ERROR_OPEN,
+    CANCELED,
+    ERROR_UNSUPPORTED_HASH
+};
+
+
 // --- Handle de fenêtres et variables d'état globales ---
 HWND g_hMainWindow;
 HWND g_hProgressGlobal, g_hProgressFile, g_hLogBox;
 HWND g_hBtnStart, g_hBtnExit;
 HWND g_hLabelGlobalProgress, g_hLabelFileProgress;
 
-/// @brief Contrôle l'état d'exécution des threads de travail.
-std::atomic<bool> g_IsRunning(false);
+/// @brief Gère la demande d'arrêt pour tous les threads de travail (C++20).
+std::stop_source g_stopSource;
+/// @brief Gère le thread manager principal (C++20).
+std::jthread g_managerThread;
 
 // --- Compteurs atomiques pour les statistiques ---
 std::atomic<int> g_CountOk(0);
@@ -107,9 +127,7 @@ std::atomic<int> g_CountCorrupted(0);
 std::atomic<int> g_CountMissing(0);
 
 // --- Synchronisation du pool de threads ---
-/// @brief Index atomique du prochain fichier à traiter par le pool.
 std::atomic<size_t> g_nextFileIndex(0);
-/// @brief Compteur atomique du nombre de fichiers traités.
 std::atomic<int> g_filesProcessedCount(0);
 
 
@@ -119,6 +137,7 @@ std::atomic<int> g_filesProcessedCount(0);
 
 /**
  * @brief Calcule la vitesse de traitement en Mo/s sur une fenêtre glissante.
+ * (Inchangé, déjà moderne)
  */
 struct SpeedBuffer {
     std::deque<std::pair<std::chrono::steady_clock::time_point, size_t>> samples;
@@ -140,26 +159,28 @@ struct SpeedBuffer {
 };
 
 /**
- * @brief Convertit une chaîne UTF-8 (std::string) en UTF-16 (std::wstring).
+ * @brief Convertit une chaîne UTF-8 (std::string_view) en UTF-16 (std::wstring).
+ * Utilise std::string_view (C++17).
  */
-std::wstring s2ws(const std::string& s) {
-    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+std::wstring s2ws(std::string_view s) {
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.length()), nullptr, 0);
     if (len == 0) return L"";
-    std::wstring r(len - 1, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &r[0], len);
+    std::wstring r(len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.length()), &r[0], len);
     return r;
 }
 
 /**
  * @brief Extrait le nom de fichier d'un chemin complet.
+ * Utilise std::filesystem (C++17).
  */
-std::string GetFileName(const std::string &path) {
-    size_t pos = path.find_last_of("\\/");
-    return (pos != std::string::npos) ? path.substr(pos + 1) : path;
+std::string GetFileName(std::string_view path) {
+    return std::filesystem::path(path).filename().string();
 }
 
 /**
  * @brief Formate une taille en octets en une chaîne lisible (Ko, Mo, Go).
+ * Utilise std::format (C++20).
  */
 std::string FormatFileSize(uint64_t bytes) {
     const char* units[] = {"B", "KB", "MB", "GB"};
@@ -169,18 +190,17 @@ std::string FormatFileSize(uint64_t bytes) {
         size /= 1024;
         i++;
     }
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(2) << size << " " << units[i];
-    return oss.str();
+    return std::format("{:.2f} {}", size, units[i]);
 }
 
 /**
  * @brief Normalise une chaîne de hash (minuscules, sans "0x" ni zéros en tête).
+ * Utilise std::string_view (C++17).
  */
-std::string NormalizeHash(const std::string &h) {
-    std::string s = h;
+std::string NormalizeHash(std::string_view h) {
+    std::string s(h); // Crée une copie pour la modification
     std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-    if (s.rfind("0x", 0) == 0) s = s.substr(2);
+    if (s.starts_with("0x")) s = s.substr(2);
     s.erase(0, s.find_first_not_of('0'));
     return s.empty() ? "0" : s;
 }
@@ -197,6 +217,8 @@ void MakeCrcTable() {
         crc32_table[i] = c;
     }
 }
+// Garantit que MakeCrcTable() n'est appelée qu'une seule fois.
+static std::once_flag g_crcTableFlag;
 
 
 // =================================================================================
@@ -205,43 +227,47 @@ void MakeCrcTable() {
 
 /**
  * @brief Vérifie un fichier unique en calculant son hash et en le comparant.
- * @details Cette fonction est conçue pour être exécutée par les threads workers.
- * Elle envoie des messages à l'UI pour rapporter sa progression.
+ * @details Gère l'annulation via std::stop_token (C++20).
+ * Utilise std::unique_ptr pour les messages de progression.
+ * Utilise std::format (C++20) pour la sortie de hash.
+ * Retourne un VerifyStatus typé.
+ * @param stopToken Le token pour vérifier si l'arrêt a été demandé.
  * @param item L'entrée de fichier à vérifier.
  * @param hashType L'algorithme de hash à utiliser.
- * @param[out] fileSize Taille du fichier en octets, déterminée par la fonction.
- * @return Une chaîne de caractères indiquant le statut ("OK", "CORRUPTED", "MISSING", etc.).
+ * @param[out] fileSize Taille du fichier en octets.
+ * @return Un VerifyStatus indiquant le résultat.
  */
-std::string VerifyFile(const FileEntry &item, HashType hashType, uint64_t &fileSize) {
+VerifyStatus VerifyFile(std::stop_token stopToken, const FileEntry &item, HashType hashType, uint64_t &fileSize) {
     namespace fs = std::filesystem;
     std::string filename = GetFileName(item.path);
 
+    // Lambda pour poster la progression en utilisant std::unique_ptr
     auto post_progress = [&](int percentage, double speed) {
-        auto* data = new FileProgressData{ s2ws(filename), percentage, speed };
-        PostMessage(g_hMainWindow, WM_APP_UPDATE_FILE_PROGRESS, 0, (LPARAM)data);
+        auto data = std::make_unique<FileProgressData>(s2ws(filename), percentage, speed);
+        PostMessage(g_hMainWindow, WM_APP_UPDATE_FILE_PROGRESS, 0, (LPARAM)data.release());
     };
 
     post_progress(0, 0.0);
 
     if (!fs::exists(item.path)) {
         g_CountMissing++;
-        return "MISSING";
+        return VerifyStatus::MISSING;
     }
 
     try {
         fileSize = fs::file_size(item.path);
     } catch (const fs::filesystem_error&) {
         g_CountCorrupted++;
-        return "ERROR_SIZE";
+        return VerifyStatus::ERROR_SIZE;
     }
 
     std::ifstream f(item.path, std::ios::binary);
     if (!f.is_open()) {
         g_CountCorrupted++;
-        return "ERROR_OPEN";
+        return VerifyStatus::ERROR_OPEN;
     }
 
-    const size_t BUF_SIZE = 16 * 1024 * 1024; // Buffer de 16 Mo pour des I/O efficaces
+    const size_t BUF_SIZE = 16 * 1024 * 1024; // 16 Mo
     std::vector<char> buffer(BUF_SIZE);
     uint64_t readTotal = 0;
     SpeedBuffer speedBuffer;
@@ -267,12 +293,10 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, uint64_t &fileS
                 if (r == 0) break;
                 for (int i = 0; i < r; ++i) crc = (crc >> 8) ^ crc32_table[(crc ^ (uint8_t)buffer[i]) & 0xFF];
                 update_logic(r);
-                if (!g_IsRunning) return "CANCELED";
+                if (stopToken.stop_requested()) return VerifyStatus::CANCELED;
             }
             crc ^= 0xFFFFFFFFu;
-            std::ostringstream oss;
-            oss << std::hex << std::setw(8) << std::setfill('0') << crc;
-            resultHash = oss.str();
+            resultHash = std::format("{:08x}", crc); // C++20
             break;
         }
         case HashType::XXH3: {
@@ -284,17 +308,18 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, uint64_t &fileS
                 if (r == 0) break;
                 XXH3_64bits_update(state, buffer.data(), r);
                 update_logic(r);
-                if (!g_IsRunning) { XXH3_freeState(state); return "CANCELED"; }
+                if (stopToken.stop_requested()) {
+                    XXH3_freeState(state);
+                    return VerifyStatus::CANCELED;
+                }
             }
             uint64_t h = XXH3_64bits_digest(state);
             XXH3_freeState(state);
-            std::ostringstream oss;
-            oss << std::hex << std::setw(16) << std::setfill('0') << h;
-            resultHash = oss.str();
+            resultHash = std::format("{:016x}", h); // C++20
             break;
         }
         case HashType::CITY128: {
-            // Note: CityHash128 n'a pas d'API de streaming, ce qui peut consommer de la RAM pour les très gros fichiers.
+            // Note: CityHash128 sans API streaming (comme dans l'original)
             std::vector<char> fileContent;
             fileContent.reserve(fileSize);
             while (f) {
@@ -303,21 +328,22 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, uint64_t &fileS
                 if (r == 0) break;
                 fileContent.insert(fileContent.end(), buffer.data(), buffer.data() + r);
                 update_logic(r);
-                if (!g_IsRunning) return "CANCELED";
+                if (stopToken.stop_requested()) return VerifyStatus::CANCELED;
             }
             uint128 hash128 = CityHash128(fileContent.data(), fileContent.size());
-            std::ostringstream oss;
-            oss << std::hex << std::setw(16) << std::setfill('0') << Uint128High64(hash128)
-                << std::hex << std::setw(16) << std::setfill('0') << Uint128Low64(hash128);
-            resultHash = oss.str();
+            resultHash = std::format("{:016x}{:016x}", // C++20
+                                     Uint128High64(hash128),
+                                     Uint128Low64(hash128));
             break;
         }
-        default: return "ERROR_UNSUPPORTED_HASH";
+        default: return VerifyStatus::ERROR_UNSUPPORTED_HASH;
     }
 
-    std::string status = (NormalizeHash(resultHash) == NormalizeHash(item.expectedHash)) ? "OK" : "CORRUPTED";
+    VerifyStatus status = (NormalizeHash(resultHash) == NormalizeHash(item.expectedHash)) 
+                          ? VerifyStatus::OK 
+                          : VerifyStatus::CORRUPTED;
     
-    if (status == "OK") g_CountOk++;
+    if (status == VerifyStatus::OK) g_CountOk++;
     else g_CountCorrupted++;
     
     post_progress(100, speedBuffer.GetSpeed());
@@ -326,27 +352,29 @@ std::string VerifyFile(const FileEntry &item, HashType hashType, uint64_t &fileS
 
 /**
  * @brief Parse un fichier manifeste de sommes de contrôle.
- * @return `true` si le chargement et le parsing réussissent, `false` sinon.
+ * Utilise std::filesystem::path (C++17).
  */
-bool LoadManifest(const std::string &filename, std::vector<FileEntry> &outFiles, HashType &outHashType) {
-    std::ifstream f(filename);
+bool LoadManifest(const std::filesystem::path& manifestPath, std::vector<FileEntry> &outFiles, HashType &outHashType) {
+    std::ifstream f(manifestPath);
     if (!f.is_open()) return false;
 
-    if (filename.find(".xxhash3") != std::string::npos) outHashType = HashType::XXH3;
-    else if (filename.find(".crc32") != std::string::npos) outHashType = HashType::CRC32;
-    else if (filename.find(".city128") != std::string::npos) outHashType = HashType::CITY128;
+    std::string ext = manifestPath.extension().string();
+    if (ext == ".xxhash3") outHashType = HashType::XXH3;
+    else if (ext == ".crc32") outHashType = HashType::CRC32;
+    else if (ext == ".city128") outHashType = HashType::CITY128;
     else return false;
 
     std::string line;
     while (std::getline(f, line)) {
-        if (line.empty() || line[0] == ';') continue; // Ignorer les lignes vides et les commentaires
+        if (line.empty() || line.starts_with(';')) continue; // C++20 starts_with
         std::istringstream iss(line);
         std::string hash, path;
         iss >> hash;
         std::getline(iss, path);
+        
         // Nettoyer le chemin
-        if (!path.empty() && path[0] == ' ') path.erase(0, 1);
-        if (!path.empty() && path[0] == '*') path.erase(0, 1);
+        path.erase(0, path.find_first_not_of(" *"));
+        
         if (!path.empty()) outFiles.push_back({path, hash});
     }
     return true;
@@ -358,73 +386,98 @@ bool LoadManifest(const std::string &filename, std::vector<FileEntry> &outFiles,
 // =================================================================================
 
 /**
- * @brief Fonction exécutée par chaque thread ouvrier du pool.
- * @details Chaque thread récupère itérativement un fichier à traiter depuis la liste
- * globale de manière atomique, le traite, puis rapporte le résultat.
- * @param files Pointeur vers le vecteur contenant tous les fichiers à traiter.
+ * @brief Fonction exécutée par chaque thread ouvrier (jthread).
+ * @details Gère l'annulation via std::stop_token (C++20).
+ * Utilise std::format (C++20) et std::unique_ptr pour le logging.
+ * @param stopToken Token d'arrêt propagé depuis le thread manager.
+ * @param files Pointeur vers le vecteur de fichiers (lecture seule).
  * @param hashType L'algorithme de hash à utiliser.
- * @param totalFiles Le nombre total de fichiers dans la liste.
+ * @param totalFiles Le nombre total de fichiers.
  */
-void HashWorker(const std::vector<FileEntry>* files, HashType hashType, int totalFiles) {
-    while (g_IsRunning) {
+void HashWorker(std::stop_token stopToken, const std::vector<FileEntry>* files, HashType hashType, int totalFiles) {
+    
+    while (!stopToken.stop_requested()) {
         size_t currentIndex = g_nextFileIndex.fetch_add(1);
         if (currentIndex >= (size_t)totalFiles) break; // Plus de travail
 
         const FileEntry& f = (*files)[currentIndex];
         uint64_t fileSize = 0;
 
-        std::string status = VerifyFile(f, hashType, fileSize);
+        VerifyStatus status = VerifyFile(stopToken, f, hashType, fileSize);
+        
+        // Si l'arrêt a été demandé pendant VerifyFile, on s'arrête ici.
+        if (status == VerifyStatus::CANCELED) break;
         
         int processedCount = g_filesProcessedCount.fetch_add(1) + 1;
         PostMessage(g_hMainWindow, WM_APP_UPDATE_GLOBAL_PROGRESS, processedCount, totalFiles);
 
         std::string statusPrefix;
         COLORREF statusColor;
-        if (status == "OK") { statusPrefix = "[✓] "; statusColor = RGB(0, 150, 0); }
-        else if (status == "CORRUPTED" || status.rfind("ERROR", 0) == 0) { statusPrefix = "[✗] "; statusColor = RGB(200, 0, 0); }
-        else if (status == "MISSING") { statusPrefix = "[?] "; statusColor = RGB(255, 165, 0); }
-        else if (status == "CANCELED") { break; }
-        else { statusPrefix = "[!] "; statusColor = RGB(200, 0, 0); }
+
+        switch (status) {
+            case VerifyStatus::OK:
+                statusPrefix = "[✓] "; statusColor = RGB(0, 150, 0); break;
+            case VerifyStatus::CORRUPTED:
+            case VerifyStatus::ERROR_SIZE:
+            case VerifyStatus::ERROR_OPEN:
+            case VerifyStatus::ERROR_UNSUPPORTED_HASH:
+                statusPrefix = "[✗] "; statusColor = RGB(200, 0, 0); break;
+            case VerifyStatus::MISSING:
+                statusPrefix = "[?] "; statusColor = RGB(255, 165, 0); break;
+            case VerifyStatus::CANCELED: // Ne devrait pas arriver ici, mais pour être complet
+                break;
+        }
         
-        std::string logLine = statusPrefix + f.path + " (" + FormatFileSize(fileSize) + ") - " + status;
-        auto* logData = new LogData{ s2ws(logLine), statusColor };
-        PostMessage(g_hMainWindow, WM_APP_APPEND_LOG, 0, (LPARAM)logData);
+        std::string statusStr;
+        if (status == VerifyStatus::OK) statusStr = "OK";
+        else if (status == VerifyStatus::CORRUPTED) statusStr = "CORRUPTED";
+        else if (status == VerifyStatus::MISSING) statusStr = "MISSING";
+        else statusStr = "ERROR";
+
+        std::string logLine = std::format("{} {} ({}) - {}", 
+                                          statusPrefix, f.path, FormatFileSize(fileSize), statusStr);
+        
+        auto logData = std::make_unique<LogData>(s2ws(logLine), statusColor);
+        PostMessage(g_hMainWindow, WM_APP_APPEND_LOG, 0, (LPARAM)logData.release());
     }
 }
 
 /**
  * @brief Thread manager qui orchestre le processus de vérification.
- * @details Prépare les données, détermine le nombre de threads, les lance,
- * attend leur complétion, et signale la fin de la tâche.
+ * @details Utilise std::jthread pour le pool de workers (C++20).
+ * Utilise std::call_once pour l'initialisation de la table CRC.
+ * Utilise std::unique_ptr pour les données et les messages.
+ * @param stopToken Token d'arrêt (C++20) pour l'annulation.
  */
-void ManagerThread() {
+void ManagerThread(std::stop_token stopToken) {
     // --- Initialisation ---
     g_CountOk = 0; g_CountCorrupted = 0; g_CountMissing = 0;
     g_nextFileIndex = 0; g_filesProcessedCount = 0;
-    MakeCrcTable();
+    std::call_once(g_crcTableFlag, MakeCrcTable); // Initialisation thread-safe
 
     auto post_log = [](const std::string& text, COLORREF color) {
-        PostMessage(g_hMainWindow, WM_APP_APPEND_LOG, 0, (LPARAM)new LogData{ s2ws(text), color });
+        auto data = std::make_unique<LogData>(s2ws(text), color);
+        PostMessage(g_hMainWindow, WM_APP_APPEND_LOG, 0, (LPARAM)data.release());
     };
 
     // --- Chargement du manifeste ---
-    auto* files = new std::vector<FileEntry>();
+    auto files = std::make_unique<std::vector<FileEntry>>();
     HashType hashType = HashType::NONE;
-    std::vector<std::string> candidates = {"CRC.xxhash3", "CRC.crc32", "CRC.city128"};
+    std::vector<std::filesystem::path> candidates = {"CRC.xxhash3", "CRC.crc32", "CRC.city128"};
     std::string loadedFile;
 
     for (const auto &c : candidates) {
         if (std::filesystem::exists(c)) {
             if (LoadManifest(c, *files, hashType)) {
-                loadedFile = c;
+                loadedFile = c.string();
                 break;
             }
         }
     }
 
     if (loadedFile.empty()) {
-        PostMessage(g_hMainWindow, WM_APP_TASK_ERROR, 0, (LPARAM)new LogData{L"Erreur: no (.crc32, .xxhash3, .city128) ", RGB(200,0,0)});
-        delete files;
+        auto err = std::make_unique<LogData>(L"Erreur: Aucun manifeste (.crc32, .xxhash3, .city128) trouvé.", RGB(200,0,0));
+        PostMessage(g_hMainWindow, WM_APP_TASK_ERROR, 0, (LPARAM)err.release());
         return;
     }
     
@@ -432,8 +485,8 @@ void ManagerThread() {
     int totalFiles = files->size();
 
     if (totalFiles == 0) {
-        PostMessage(g_hMainWindow, WM_APP_TASK_ERROR, 0, (LPARAM)new LogData{L"Erreur: manifeste emptie.", RGB(200,0,0)});
-        delete files;
+        auto err = std::make_unique<LogData>(L"Erreur: Le manifeste est vide.", RGB(200,0,0));
+        PostMessage(g_hMainWindow, WM_APP_TASK_ERROR, 0, (LPARAM)err.release());
         return;
     }
 
@@ -444,24 +497,25 @@ void ManagerThread() {
     unsigned int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 2; // Valeur par défaut
     
-    std::vector<std::thread> threads;
+    std::vector<std::jthread> threads;
     for (unsigned int i = 0; i < num_threads; ++i) {
-        threads.emplace_back(HashWorker, files, hashType, totalFiles);
+        // Le stopToken du manager est passé aux workers.
+        threads.emplace_back(HashWorker, stopToken, files.get(), hashType, totalFiles);
     }
 
     // --- Attente de la complétion ---
-    for (auto& t : threads) {
-        if (t.joinable()) t.join();
-    }
+    // Pas besoin de boucle join() !
+    // Les destructeurs de std::jthread dans ~std::vector<std::jthread> 
+    // s'en chargeront automatiquement lorsque 'threads' sortira du scope.
     
-    delete files; // Libération de la mémoire partagée
+    // files.reset(); // (Optionnel) unique_ptr le fera aussi en sortie de scope
 
     // --- Finalisation ---
     auto endTime = std::chrono::steady_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime).count();
     
-    auto* completionData = new TaskCompleteData{ totalFiles, duration, !g_IsRunning };
-    PostMessage(g_hMainWindow, WM_APP_TASK_COMPLETE, 0, (LPARAM)completionData);
+    auto completionData = std::make_unique<TaskCompleteData>(totalFiles, duration, stopToken.stop_requested());
+    PostMessage(g_hMainWindow, WM_APP_TASK_COMPLETE, 0, (LPARAM)completionData.release());
 }
 
 
@@ -471,7 +525,7 @@ void ManagerThread() {
 
 /**
  * @brief Ajoute une ligne de texte colorée au contrôle Rich Edit.
- * @details Doit être appelée exclusivement depuis le thread UI.
+ * (Inchangé, API Win32 pure)
  */
 void AppendLog_UI(const std::wstring &wline, COLORREF color) {
     DWORD len = GetWindowTextLengthW(g_hLogBox);
@@ -487,106 +541,130 @@ void AppendLog_UI(const std::wstring &wline, COLORREF color) {
 
 /**
  * @brief Procédure de fenêtre principale, gère les messages Windows.
+ * @details Utilise std::unique_ptr pour gérer la mémoire des messages (RAII).
+ * Utilise std::format (C++20) pour la mise à jour des labels.
+ * Gère le cycle de vie de std::jthread et std::stop_source.
  */
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_APP_UPDATE_FILE_PROGRESS: {
-            FileProgressData* data = reinterpret_cast<FileProgressData*>(lParam);
-            std::wostringstream woss;
-            woss << L"Files: " << data->filename << L" - " << data->percentage << L"%";
+            // RAII: Le pointeur est géré par unique_ptr dès sa réception.
+            auto data = std::unique_ptr<FileProgressData>(reinterpret_cast<FileProgressData*>(lParam));
+            
+            std::wstring text;
             if (data->speed_MBps > 0.0) {
-                woss << L" (" << std::fixed << std::setprecision(2) << data->speed_MBps << L" Mo/s)";
+                text = std::format(L"Fichier: {} - {}% ({:.2f} Mo/s)", // C++20
+                                   data->filename, data->percentage, data->speed_MBps);
+            } else {
+                text = std::format(L"Fichier: {} - {}%", // C++20
+                                   data->filename, data->percentage);
             }
-            SetWindowTextW(g_hLabelFileProgress, woss.str().c_str());
+            SetWindowTextW(g_hLabelFileProgress, text.c_str());
             SendMessage(g_hProgressFile, PBM_SETPOS, data->percentage, 0);
-            delete data;
+            
+            // delete data; // Plus nécessaire! unique_ptr s'en charge.
             break;
         }
 
         case WM_APP_UPDATE_GLOBAL_PROGRESS: {
             int current = (int)wParam;
             int total = (int)lParam;
-            std::wostringstream woss;
-            woss << L"Progress: " << current << L"/" << total << L" (" << ((total > 0) ? (current * 100 / total) : 0) << L"%)";
-            SetWindowTextW(g_hLabelGlobalProgress, woss.str().c_str());
+            std::wstring text = std::format(L"Progrès: {}/{} ({}%)", // C++20
+                                            current, total, (total > 0) ? (current * 100 / total) : 0);
+            
+            SetWindowTextW(g_hLabelGlobalProgress, text.c_str());
             SendMessage(g_hProgressGlobal, PBM_SETRANGE32, 0, total);
             SendMessage(g_hProgressGlobal, PBM_SETPOS, current, 0);
             break;
         }
 
         case WM_APP_APPEND_LOG: {
-            LogData* data = reinterpret_cast<LogData*>(lParam);
+            auto data = std::unique_ptr<LogData>(reinterpret_cast<LogData*>(lParam));
             AppendLog_UI(data->text, data->color);
-            delete data;
             break;
         }
         
         case WM_APP_TASK_ERROR: {
-            LogData* data = reinterpret_cast<LogData*>(lParam);
+            auto data = std::unique_ptr<LogData>(reinterpret_cast<LogData*>(lParam));
             AppendLog_UI(data->text, data->color);
-            delete data;
-            g_IsRunning = false;
-            SetWindowTextW(g_hBtnStart, L"Strat");
+            
+            if (g_managerThread.joinable()) {
+                g_managerThread.join(); // Nettoyer le thread terminé
+            }
+            SetWindowTextW(g_hBtnStart, L"Démarrer");
             break;
         }
         
         case WM_APP_TASK_COMPLETE: {
-            TaskCompleteData* data = reinterpret_cast<TaskCompleteData*>(lParam);
-            SetWindowTextW(g_hLabelFileProgress, L"Files: Prêt");
+            auto data = std::unique_ptr<TaskCompleteData>(reinterpret_cast<TaskCompleteData*>(lParam));
+            
+            SetWindowTextW(g_hLabelFileProgress, L"Fichier: Prêt");
             SendMessage(g_hProgressFile, PBM_SETPOS, 0, 0);
             
             if (!data->wasCanceled) {
                 AppendLog_UI(L"", RGB(0,0,0)); // Ligne vide
-                std::wostringstream report;
-                report << L"---FINAL ---\n"
-                       << L"files: " << data->totalFiles << L"\n";
-                AppendLog_UI(report.str(), RGB(0,0,0));
+                std::wstring report = std::format(L"--- RAPPORT FINAL ---\nFichiers totaux: {}\n", data->totalFiles);
+                AppendLog_UI(report, RGB(0,0,0));
 
                 auto add_report_line = [&](const std::wstring& label, int count, COLORREF color) {
                     double p = (data->totalFiles > 0) ? (static_cast<double>(count) / data->totalFiles * 100.0) : 0.0;
-                    std::wostringstream line;
-                    line << label << count << L" Files (" << std::fixed << std::setprecision(2) << p << L"%)";
-                    AppendLog_UI(line.str(), color);
+                    std::wstring line = std::format(L"{}: {} Fichiers ({:.2f}%)", label, count, p);
+                    AppendLog_UI(line, color);
                 };
                 
-                add_report_line(L"OK (green): ", g_CountOk, RGB(0,150,0));
-                add_report_line(L"corrupted (red): ", g_CountCorrupted, RGB(200,0,0));
-                add_report_line(L"Missing  (Orange): ", g_CountMissing, RGB(255,165,0));
+                add_report_line(L"  [✓] Intègres", g_CountOk.load(), RGB(0,150,0));
+                add_report_line(L"  [✗] Corrompus", g_CountCorrupted.load(), RGB(200,0,0));
+                add_report_line(L"  [?] Manquants", g_CountMissing.load(), RGB(255,165,0));
 
-                report.str(L""); report.clear();
-                report << L"\n✓ proc finish (Durée: " << data->duration_s << L" secondes)";
-                AppendLog_UI(report.str(), RGB(0, 150, 0));
+                report = std::format(L"\n✓ Vérification terminée (Durée: {} secondes)", data->duration_s);
+                AppendLog_UI(report, RGB(0, 150, 0));
                 
             } else {
-                AppendLog_UI(L"\n! stop by user.", RGB(200, 0, 0));
+                AppendLog_UI(L"\n! Opération annulée par l'utilisateur.", RGB(200, 0, 0));
             }
             
-            g_IsRunning = false;
-            SetWindowTextW(g_hBtnStart, L"Start");
-            delete data;
+            if (g_managerThread.joinable()) {
+                g_managerThread.join(); // Nettoyer le thread terminé
+            }
+            SetWindowTextW(g_hBtnStart, L"Démarrer");
             break;
         }
 
         case WM_COMMAND:
             if (LOWORD(wParam) == 1) { // Bouton Démarrer/Arrêter
-                if (!g_IsRunning) {
+                if (!g_managerThread.joinable()) {
+                    // Démarrer
                     SendMessage(g_hLogBox, WM_SETTEXT, 0, (LPARAM)L"");
-                    g_IsRunning = true;
-                    std::thread(ManagerThread).detach();
+                    
+                    g_stopSource = std::stop_source(); // Créer une nouvelle source d'arrêt
+                    g_managerThread = std::jthread(ManagerThread, g_stopSource.get_token());
+                    
                     SetWindowTextW(g_hBtnStart, L"Arrêter");
                 } else {
-                    g_IsRunning = false; // Les threads s'arrêteront au prochain check
+                    // Arrêter
+                    g_stopSource.request_stop(); // Demander l'arrêt (C++20)
+                    // L'UI sera mise à jour lorsque le message TASK_COMPLETE arrivera.
                 }
-            } else if (LOWORD(wParam) == 2 && !g_IsRunning) { // Bouton Quitter
+            } else if (LOWORD(wParam) == 2 && !g_managerThread.joinable()) { // Bouton Quitter
                 DestroyWindow(hwnd);
             }
             break;
 
         case WM_CLOSE:
-            if (!g_IsRunning) DestroyWindow(hwnd);
+            if (!g_managerThread.joinable()) {
+                DestroyWindow(hwnd);
+            } else {
+                // Optionnel: Demander à l'utilisateur s'il veut vraiment quitter
+                // Pour l'instant, on ignore la fermeture si le travail est en cours.
+            }
             break;
 
         case WM_DESTROY:
+            // S'assurer que le thread est arrêté et joint avant de quitter
+            if (g_managerThread.joinable()) {
+                g_stopSource.request_stop();
+                g_managerThread.join();
+            }
             PostQuitMessage(0);
             break;
             
@@ -617,7 +695,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
     RegisterClassW(&wc);
 
     // --- Création de la fenêtre principale ---
-    g_hMainWindow = CreateWindowExW(0, L"FileHasherWindowClass", L"NewCrc 0.4",
+    g_hMainWindow = CreateWindowExW(0, L"FileHasherWindowClass", L"NewCrc 0.4.1",
         WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 700, 540, nullptr, nullptr, hInst, nullptr);
 
@@ -625,12 +703,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
 
     // --- Création des contrôles de l'interface ---
     g_hLogBox = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY, 10, 10, 660, 325, g_hMainWindow, nullptr, hInst, nullptr);
-    g_hLabelFileProgress = CreateWindowExW(0, L"STATIC", L"Wait", WS_CHILD | WS_VISIBLE, 10, 345, 660, 20, g_hMainWindow, nullptr, hInst, nullptr);
+    g_hLabelFileProgress = CreateWindowExW(0, L"STATIC", L"File ready", WS_CHILD | WS_VISIBLE, 10, 345, 660, 20, g_hMainWindow, nullptr, hInst, nullptr);
     g_hProgressFile = CreateWindowExW(0, PROGRESS_CLASS, nullptr, WS_CHILD | WS_VISIBLE | PBS_SMOOTH, 10, 370, 450, 20, g_hMainWindow, nullptr, hInst, nullptr);
     g_hLabelGlobalProgress = CreateWindowExW(0, L"STATIC", L"Progress: 0/0 (0%)", WS_CHILD | WS_VISIBLE, 10, 400, 660, 20, g_hMainWindow, nullptr, hInst, nullptr);
     g_hProgressGlobal = CreateWindowExW(0, PROGRESS_CLASS, nullptr, WS_CHILD | WS_VISIBLE | PBS_SMOOTH, 10, 425, 660, 20, g_hMainWindow, nullptr, hInst, nullptr);
-    g_hBtnStart = CreateWindowExW(0, L"BUTTON", L"Start", WS_CHILD | WS_VISIBLE, 480, 368, 90, 25, g_hMainWindow, (HMENU)1, hInst, nullptr);
-    g_hBtnExit = CreateWindowExW(0, L"BUTTON", L"Exit", WS_CHILD | WS_VISIBLE, 580, 368, 90, 25, g_hMainWindow, (HMENU)2, hInst, nullptr);
+    g_hBtnStart = CreateWindowExW(0, L"BUTTON", L"START", WS_CHILD | WS_VISIBLE, 480, 368, 90, 25, g_hMainWindow, (HMENU)1, hInst, nullptr);
+    g_hBtnExit = CreateWindowExW(0, L"BUTTON", L"QUIT", WS_CHILD | WS_VISIBLE, 580, 368, 90, 25, g_hMainWindow, (HMENU)2, hInst, nullptr);
 
     // --- Démarrage automatique (optionnel) ---
     int nArgs;
@@ -642,7 +720,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
 
     // --- Affichage de la fenêtre et boucle de messages ---
     ShowWindow(g_hMainWindow, nCmdShow);
-    UpdateWindow(g_hMainWindow); // Corrigé: Un seul argument
+    UpdateWindow(g_hMainWindow); // Corrigé (l'original avait un paramètre en trop)
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {

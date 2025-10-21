@@ -1,30 +1,28 @@
 # NewCrc
 
-## ia use in code cause C++ pain 
+## Purpose
 
-This is a Win32 GUI application for verifying file integrity using CRC32 or XXH3 or city128 hashes.
+NewCrc is a Win32 GUI application for verifying file integrity using **CRC32**, **XXH3**, or **City128** hashes. 
 
-### Usage
+note ia use in code 
+## Usage
 
-1.  Place the executable (NewCrc.exe) in the directory with the files to check.
-2.  Ensure a hash list file (`CRC.crc32` or `CRC.xxhash3`, `CRC.city128`) is present.
+1. Place `NewCrc.exe` in the folder containing the files to check.  
+2. Ensure a hash list file is present in the same folder:
+   - `CRC.crc32`
+   - `CRC.xxhash3`
+   - `CRC.city128`
+
+### compile
+
+compile
+
+g++ -std=c++17 -O3 -static main.cpp xxhash.c city.cc -lole32 -lcomctl32 -lriched20 -municode -Wl,--subsystem,windows -o NewCrc.exe
+
 
 ### Command Line / Batch Mode
 
-To start the verification automatically on launch, use the `-v` flag:
+Start verification automatically on launch using the `-v` flag:
 
-```bash
+bash
 NewCrc.exe -v
-
-
-
-***
-
-
-```compile
- g++ -std=c++17 -O3 -static main.cpp xxhash.c city.cc -lole32 -lcomctl32 -lriched20 -municode -Wl,--subsystem,windows -o NewCrc.exe
- or
-g++ -std=c++17 -Oz -static main.cpp xxhash.c city.cc -lole32 -lcomctl32 -lriched20 -municode -Wl,--subsystem,windows -o NewCrc.exe
-if you want tiny size
------
-Pure speed  g++ -std=c++17 -Ofast -static main.cpp xxhash.c city.cc -lole32 -lcomctl32 -lriched20 -municode -Wl,--subsystem,windows -o NewCrc.exe
