@@ -5,6 +5,10 @@
 NewCrc is a Win32 GUI application for verifying file integrity using **CRC32**, **XXH3**, or **City128** hashes. 
 
 note ia use in code 
+## Roadmap
+c++20 or 23 update 
+seperate main file 
+
 ## Usage
 
 1. Place `NewCrc.exe` in the folder containing the files to check.  
