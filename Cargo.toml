@@ -1,0 +1,28 @@
+[package]
+name = "zhashgen"
+version = "0.1.1"
+edition = "2024"
+
+[dependencies]
+
+clap = { version = "4.5", features = ["derive", "string"] }
+
+rayon = "1.10"
+
+indicatif = "0.18.3"
+
+walkdir = "2.3"
+
+num_cpus = "1.17"
+
+sha2 = "0.10"
+
+blake2 = "0.10"
+
+crc32fast = "1.3"         # CRC32 standard
+
+crc32c = "0.6"         # CRC32C (Castagnoli)
+
+xxhash-rust = { version = "0.8", features = ["xxh3"] } # XXH3
+
+cityhash = "0.1.1"

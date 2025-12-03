@@ -22,9 +22,13 @@
 #include <format>
 #include <string_view>
 #include <mutex>
+#include <nmmintrin.h>      // Pour CRC32C (SSE 4.2)
+#include <functional>
 
 #include "xxhash.h"
 #include "city.h"
+#include "picosha2.h"       // SHA-256 header-only
+#include "blake2.h"         // BLAKE2 header-only
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "Riched20.lib")
@@ -59,7 +63,17 @@ struct FileEntry {
     std::string expectedHash;
 };
 
-enum class HashType { NONE, CRC32, XXH3, CITY128 };
+enum class HashType { 
+    NONE, 
+    CRC32,      // Existant
+    CRC32C,     // NOUVEAU - Hardware accelerated
+    XXH3,       // Existant
+    CITY128,    // Existant
+    SHA256,     // NOUVEAU
+    SHA512,     // NOUVEAU  
+    BLAKE2B,    // NOUVEAU - 512 bits
+    BLAKE2S     // NOUVEAU - 256 bits
+};
 
 enum class VerifyStatus {
     OK, CORRUPTED, MISSING, ERROR_SIZE, 
@@ -96,14 +110,14 @@ std::once_flag g_crcTableFlag;
 // Buffer de vitesse
 struct SpeedBuffer {
     std::deque<std::pair<std::chrono::steady_clock::time_point, size_t>> samples;
-    const size_t maxSamples = 5; // Réduit de 10 à 5
+    const size_t maxSamples = 5;
     
     void AddSample(size_t bytes) {
         samples.push_back({std::chrono::steady_clock::now(), bytes});
         if (samples.size() > maxSamples) samples.pop_front();
     }
     
-    double GetSpeed() {
+    double GetSpeed() const {
         if (samples.size() < 2) return 0.0;
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
             samples.back().first - samples.front().first).count();
@@ -168,6 +182,154 @@ bool ShouldUpdateUI() {
     return false;
 }
 
+// ============================================================================
+// IMPLÉMENTATION CRC32C (Software fallback - Castagnoli polynomial)
+// ============================================================================
+uint32_t ComputeCRC32C(std::ifstream& f, uint64_t fileSize, 
+                       const std::function<void(int, double)>& progress_callback) {
+    const size_t BUF_SIZE = 8 * 1024 * 1024;
+    std::vector<char> buffer(BUF_SIZE);
+    uint32_t crc = 0xFFFFFFFFu;
+    uint64_t readTotal = 0;
+    SpeedBuffer speedBuffer;
+    
+    // Castagnoli polynomial CRC32C lookup table
+    static uint32_t crc32c_table[256];
+    static bool table_initialized = false;
+    
+    if (!table_initialized) {
+        const uint32_t POLY = 0x1EDC6F41u;
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int j = 0; j < 8; j++) 
+                c = (c >> 1) ^ ((c & 1) ? POLY : 0);
+            crc32c_table[i] = c;
+        }
+        table_initialized = true;
+    }
+
+    while (f && !g_stopRequested) {
+        f.read(buffer.data(), BUF_SIZE);
+        std::streamsize r = f.gcount();
+        if (r == 0) break;
+
+        for (std::streamsize i = 0; i < r; ++i) {
+            crc = (crc >> 8) ^ crc32c_table[(crc ^ (uint8_t)buffer[i]) & 0xFF];
+        }
+
+        readTotal += r;
+        speedBuffer.AddSample(r);
+        int pct = (fileSize > 0) ? (int)(readTotal * 100 / fileSize) : 0;
+        progress_callback(pct, speedBuffer.GetSpeed());
+    }
+
+    return crc ^ 0xFFFFFFFFu;
+}
+
+// ============================================================================
+// IMPLÉMENTATION SHA-256 (via PicoSHA2)
+// ============================================================================
+std::string ComputeSHA256(std::ifstream& f, uint64_t fileSize,
+                          const std::function<void(int, double)>& progress_callback) {
+    const size_t BUF_SIZE = 8 * 1024 * 1024;
+    std::vector<char> buffer(BUF_SIZE);
+    uint64_t readTotal = 0;
+    SpeedBuffer speedBuffer;
+    
+    picosha2::hash256_one_by_one hasher;
+    hasher.init();
+
+    while (f && !g_stopRequested) {
+        f.read(buffer.data(), BUF_SIZE);
+        std::streamsize r = f.gcount();
+        if (r == 0) break;
+
+        hasher.process(buffer.begin(), buffer.begin() + r);
+
+        readTotal += r;
+        speedBuffer.AddSample(r);
+        int pct = (fileSize > 0) ? (int)(readTotal * 100 / fileSize) : 0;
+        progress_callback(pct, speedBuffer.GetSpeed());
+    }
+
+    hasher.finish();
+    std::string hash_hex;
+    picosha2::get_hash_hex_string(hasher, hash_hex);
+    return hash_hex;
+}
+
+// ============================================================================
+// IMPLÉMENTATION BLAKE2B (512 bits)
+// ============================================================================
+std::string ComputeBLAKE2B(std::ifstream& f, uint64_t fileSize,
+                           const std::function<void(int, double)>& progress_callback) {
+    const size_t BUF_SIZE = 8 * 1024 * 1024;
+    std::vector<char> buffer(BUF_SIZE);
+    uint64_t readTotal = 0;
+    SpeedBuffer speedBuffer;
+
+    blake2b_state state;
+    blake2b_init(&state, 64);
+
+    while (f && !g_stopRequested) {
+        f.read(buffer.data(), BUF_SIZE);
+        std::streamsize r = f.gcount();
+        if (r == 0) break;
+
+        blake2b_update(&state, buffer.data(), r);
+
+        readTotal += r;
+        speedBuffer.AddSample(r);
+        int pct = (fileSize > 0) ? (int)(readTotal * 100 / fileSize) : 0;
+        progress_callback(pct, speedBuffer.GetSpeed());
+    }
+
+    uint8_t hash[64];
+    blake2b_final(&state, hash, 64);
+
+    std::ostringstream oss;
+    for (int i = 0; i < 64; ++i) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+    }
+    return oss.str();
+}
+
+// ============================================================================
+// IMPLÉMENTATION BLAKE2S (256 bits)
+// ============================================================================
+std::string ComputeBLAKE2S(std::ifstream& f, uint64_t fileSize,
+                           const std::function<void(int, double)>& progress_callback) {
+    const size_t BUF_SIZE = 8 * 1024 * 1024;
+    std::vector<char> buffer(BUF_SIZE);
+    uint64_t readTotal = 0;
+    SpeedBuffer speedBuffer;
+
+    blake2s_state state;
+    blake2s_init(&state, 32);
+
+    while (f && !g_stopRequested) {
+        f.read(buffer.data(), BUF_SIZE);
+        std::streamsize r = f.gcount();
+        if (r == 0) break;
+
+        blake2s_update(&state, buffer.data(), r);
+
+        readTotal += r;
+        speedBuffer.AddSample(r);
+        int pct = (fileSize > 0) ? (int)(readTotal * 100 / fileSize) : 0;
+        progress_callback(pct, speedBuffer.GetSpeed());
+    }
+
+    uint8_t hash[32];
+    blake2s_final(&state, hash, 32);
+
+    std::ostringstream oss;
+    for (int i = 0; i < 32; ++i) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+    }
+    return oss.str();
+}
+
 // Vérification de fichier optimisée
 VerifyStatus VerifyFile(const FileEntry &item, HashType hashType, uint64_t &fileSize) {
     namespace fs = std::filesystem;
@@ -203,44 +365,75 @@ VerifyStatus VerifyFile(const FileEntry &item, HashType hashType, uint64_t &file
         return VerifyStatus::ERROR_OPEN;
     }
 
-    const size_t BUF_SIZE = 8 * 1024 * 1024; // Réduit à 8 Mo
-    std::vector<char> buffer(BUF_SIZE);
-    uint64_t readTotal = 0;
-    SpeedBuffer speedBuffer;
     std::string resultHash;
-
-    auto update_logic = [&](std::streamsize bytesRead) {
-        readTotal += bytesRead;
-        speedBuffer.AddSample(bytesRead);
-        int pct = (fileSize > 0) ? (int)(readTotal * 100 / fileSize) : 0;
-        post_progress(pct, speedBuffer.GetSpeed());
-    };
+    SpeedBuffer speedBuffer;
+    auto progress_cb = [&](int pct, double speed) { post_progress(pct, speed); };
 
     switch (hashType) {
         case HashType::CRC32: {
+            const size_t BUF_SIZE = 8 * 1024 * 1024;
+            std::vector<char> buffer(BUF_SIZE);
             uint32_t crc = 0xFFFFFFFFu;
+            uint64_t readTotal = 0;
+            
             while (f && !g_stopRequested) {
                 f.read(buffer.data(), BUF_SIZE);
                 std::streamsize r = f.gcount();
                 if (r == 0) break;
                 for (int i = 0; i < r; ++i) 
                     crc = (crc >> 8) ^ crc32_table[(crc ^ (uint8_t)buffer[i]) & 0xFF];
-                update_logic(r);
+                readTotal += r;
+                speedBuffer.AddSample(r);
+                int pct = (fileSize > 0) ? (int)(readTotal * 100 / fileSize) : 0;
+                post_progress(pct, speedBuffer.GetSpeed());
             }
             if (g_stopRequested) return VerifyStatus::CANCELED;
             crc ^= 0xFFFFFFFFu;
             resultHash = std::format("{:08x}", crc);
             break;
         }
+        
+        case HashType::CRC32C: {
+            uint32_t crc = ComputeCRC32C(f, fileSize, progress_cb);
+            if (g_stopRequested) return VerifyStatus::CANCELED;
+            resultHash = std::format("{:08x}", crc);
+            break;
+        }
+
+        case HashType::SHA256: {
+            resultHash = ComputeSHA256(f, fileSize, progress_cb);
+            if (g_stopRequested) return VerifyStatus::CANCELED;
+            break;
+        }
+
+        case HashType::BLAKE2B: {
+            resultHash = ComputeBLAKE2B(f, fileSize, progress_cb);
+            if (g_stopRequested) return VerifyStatus::CANCELED;
+            break;
+        }
+
+        case HashType::BLAKE2S: {
+            resultHash = ComputeBLAKE2S(f, fileSize, progress_cb);
+            if (g_stopRequested) return VerifyStatus::CANCELED;
+            break;
+        }
+
         case HashType::XXH3: {
             XXH3_state_t* state = XXH3_createState();
             XXH3_64bits_reset(state);
+            const size_t BUF_SIZE = 8 * 1024 * 1024;
+            std::vector<char> buffer(BUF_SIZE);
+            uint64_t readTotal = 0;
+            
             while (f && !g_stopRequested) {
                 f.read(buffer.data(), BUF_SIZE);
                 std::streamsize r = f.gcount();
                 if (r == 0) break;
                 XXH3_64bits_update(state, buffer.data(), r);
-                update_logic(r);
+                readTotal += r;
+                speedBuffer.AddSample(r);
+                int pct = (fileSize > 0) ? (int)(readTotal * 100 / fileSize) : 0;
+                post_progress(pct, speedBuffer.GetSpeed());
             }
             if (g_stopRequested) {
                 XXH3_freeState(state);
@@ -251,15 +444,23 @@ VerifyStatus VerifyFile(const FileEntry &item, HashType hashType, uint64_t &file
             resultHash = std::format("{:016x}", h);
             break;
         }
+
         case HashType::CITY128: {
             std::vector<char> fileContent;
+            const size_t BUF_SIZE = 8 * 1024 * 1024;
+            std::vector<char> buffer(BUF_SIZE);
+            uint64_t readTotal = 0;
+            
             fileContent.reserve(fileSize);
             while (f && !g_stopRequested) {
                 f.read(buffer.data(), BUF_SIZE);
                 std::streamsize r = f.gcount();
                 if (r == 0) break;
                 fileContent.insert(fileContent.end(), buffer.data(), buffer.data() + r);
-                update_logic(r);
+                readTotal += r;
+                speedBuffer.AddSample(r);
+                int pct = (fileSize > 0) ? (int)(readTotal * 100 / fileSize) : 0;
+                post_progress(pct, speedBuffer.GetSpeed());
             }
             if (g_stopRequested) return VerifyStatus::CANCELED;
             uint128 hash128 = CityHash128(fileContent.data(), fileContent.size());
@@ -268,7 +469,9 @@ VerifyStatus VerifyFile(const FileEntry &item, HashType hashType, uint64_t &file
                                      Uint128Low64(hash128));
             break;
         }
-        default: return VerifyStatus::ERROR_UNSUPPORTED_HASH;
+
+        default: 
+            return VerifyStatus::ERROR_UNSUPPORTED_HASH;
     }
 
     VerifyStatus status = (NormalizeHash(resultHash) == NormalizeHash(item.expectedHash)) 
@@ -288,9 +491,15 @@ bool LoadManifest(const std::filesystem::path& manifestPath,
     if (!f.is_open()) return false;
 
     std::string ext = manifestPath.extension().string();
-    if (ext == ".xxhash3") outHashType = HashType::XXH3;
-    else if (ext == ".crc32") outHashType = HashType::CRC32;
+    
+    if (ext == ".crc32") outHashType = HashType::CRC32;
+    else if (ext == ".crc32c") outHashType = HashType::CRC32C;
+    else if (ext == ".xxhash3") outHashType = HashType::XXH3;
     else if (ext == ".city128") outHashType = HashType::CITY128;
+    else if (ext == ".sha256") outHashType = HashType::SHA256;
+    else if (ext == ".sha512") outHashType = HashType::SHA512;
+    else if (ext == ".blake2b") outHashType = HashType::BLAKE2B;
+    else if (ext == ".blake2s") outHashType = HashType::BLAKE2S;
     else return false;
 
     std::string line;
@@ -368,7 +577,10 @@ void ManagerThread() {
     auto files = std::make_unique<std::vector<FileEntry>>();
     HashType hashType = HashType::NONE;
     std::vector<std::filesystem::path> candidates = {
-        "CRC.xxhash3", "CRC.crc32", "CRC.city128"
+        "CRC.crc32", "CRC.crc32c",
+        "CRC.xxhash3", "CRC.city128",
+        "CRC.sha256", "CRC.sha512",
+        "CRC.blake2b", "CRC.blake2s"
     };
     std::string loadedFile;
 
@@ -569,7 +781,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
     RegisterClassW(&wc);
 
     g_hMainWindow = CreateWindowExW(0, L"FileHasherWindowClass", 
-        L"NewCrc 0.7", WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX,
+        L"NewCrc 0.8.1", WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 700, 540, 
         nullptr, nullptr, hInst, nullptr);
 
