@@ -1,10 +1,5 @@
 # NewCrc
 
-# Bugs
-
-CRC32C can have somme false corrupt data
-
-
 
 ## Purpose
 
