@@ -20,7 +20,8 @@ note : ia use in code
 
 compile
 
-$ g++ -std=c++20 -Oz -static main.cpp xxhash.c city.cc -lole32 -lcomctl32 -lriched20 -municode -Wl,--subsystem,windows -o NewCrc.exe
+$ g++ -std=c++20 -Oz -msse4.2 -static     main.cpp xxhash.c city.cc blake2s-ref.c blake2b-ref.c     -I.     -lole32 -lcomctl32 -lriched20 -municode -Wl,--subsystem,windows     -o NewCrc.exe
+
 
 $ strip NewCrc.exe
 
