@@ -198,7 +198,10 @@ uint32_t ComputeCRC32C(std::ifstream& f, uint64_t fileSize,
     static bool table_initialized = false;
     
     if (!table_initialized) {
-        const uint32_t POLY = 0x1EDC6F41u;
+        // Use the reflected (reversed) Castagnoli polynomial for
+        // the right-shift / reflected CRC algorithm (CRC-32C).
+        // Normal polynomial: 0x1EDC6F41, reflected: 0x82F63B78.
+        const uint32_t POLY = 0x82F63B78u;
         for (uint32_t i = 0; i < 256; i++) {
             uint32_t c = i;
             for (int j = 0; j < 8; j++) 
@@ -393,12 +396,15 @@ VerifyStatus VerifyFile(const FileEntry &item, HashType hashType, uint64_t &file
             break;
         }
         
-        case HashType::CRC32C: {
-            uint32_t crc = ComputeCRC32C(f, fileSize, progress_cb);
-            if (g_stopRequested) return VerifyStatus::CANCELED;
-            resultHash = std::format("{:08x}", crc);
-            break;
-        }
+         case HashType::CRC32C: {
+           f.clear();
+           f.seekg(0, std::ios::beg); // <--- important
+           uint32_t crc = ComputeCRC32C(f, fileSize, post_progress);
+           if (g_stopRequested) return VerifyStatus::CANCELED;
+           resultHash = std::format("{:08x}", crc);
+           break;
+         }
+
 
         case HashType::SHA256: {
             resultHash = ComputeSHA256(f, fileSize, progress_cb);
