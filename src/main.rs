@@ -16,10 +16,29 @@ use xxhash_rust::xxh3::Xxh3;
 // Imports pour les nouveaux algorithmes
 use blake2::{Blake2b512, Blake2s256};
 use sha2::{Digest, Sha256, Sha512};
+use once_cell::sync::Lazy;
 
 // La taille du tampon pour le mode streaming (1 MiB)
 const BUFFER_SIZE: usize = 1024 * 1024;
 const DEFAULT_FULL_LOAD_LIMIT: u64 = 200 * 1024 * 1024;
+
+// CRC32C (Castagnoli) lookup table (reflected polynomial 0x82F63B78)
+static CRC32C_TABLE: Lazy<[u32; 256]> = Lazy::new(|| {
+    let poly: u32 = 0x82F63B78u32;
+    let mut table = [0u32; 256];
+    for i in 0..256u32 {
+        let mut c = i;
+        for _ in 0..8 {
+            if (c & 1) != 0 {
+                c = poly ^ (c >> 1);
+            } else {
+                c = c >> 1;
+            }
+        }
+        table[i as usize] = c;
+    }
+    table
+});
 
 #[derive(Parser)]
 struct Args {
@@ -259,25 +278,30 @@ impl HashingStream for Crc32Stream {
     }
 }
 
-// Implémentation pour CRC32C
+// Implémentation pour CRC32C (streaming via table-driven algorithm)
 struct Crc32cStream {
     digest: u32,
 }
 
 impl Crc32cStream {
     fn new() -> Self {
-        Crc32cStream { digest: 0 }
+        // Start with all-ones as is standard for CRC-32C (we XOR at the end)
+        Crc32cStream { digest: 0xFFFF_FFFFu32 }
     }
 }
 
 impl HashingStream for Crc32cStream {
     fn update(&mut self, data: &[u8]) {
-        // CRC32C is computed over the full data, so XOR the previous digest with new one
-        let new_digest = crc32c(data);
-        self.digest ^= new_digest;
+        let table = &*CRC32C_TABLE;
+        let mut crc = self.digest;
+        for &b in data {
+            crc = (crc >> 8) ^ table[((crc as u8) ^ b) as usize];
+        }
+        self.digest = crc;
     }
     fn finalize(&mut self) -> String {
-        format!("{:08x}", self.digest)
+        let final_crc = self.digest ^ 0xFFFF_FFFFu32;
+        format!("{:08x}", final_crc)
     }
 }
 
