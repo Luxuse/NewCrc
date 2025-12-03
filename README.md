@@ -1,12 +1,18 @@
 # NewCrc
 
+# BUGS
+-crc32c corrupt file not working
+-SHA512 not include
+
+
 ## Purpose
 
-NewCrc is a Win32 GUI application for verifying file integrity using **CRC32**, **XXH3**, or **City128** hashes. 
+NewCrc is a Win32 GUI application for verifying file integrity using **CRC32**, **XXH3**, or **City128**, or **blake2s** and others hashes. 
 
 note : ia use in code 
 ## Roadmap
 
+Fix crc32c and add SHA512 support fix GUI block thread and add other hash
 
 ## Usage
 
@@ -15,7 +21,9 @@ note : ia use in code
    - `CRC.crc32`
    - `CRC.xxhash3`
    - `CRC.city128`
-
+   - `CRC.crc32c`
+   - `CRC.Blake2b`
+....
 ### compile
 
 compile
